@@ -57,6 +57,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [mediaGalleryVisible, setMediaGalleryVisible] = useState(false);
 
   const [pendingQueue, setPendingQueue] = useState([]);
+  const pendingQueueRef = useRef(pendingQueue);
+  pendingQueueRef.current = pendingQueue;
 
   const shortTimer = useRef(null);
   const longTimer = useRef(null);
@@ -91,39 +93,66 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   }, [pendingQueue]);
 
   useEffect(() => {
-    const processQueue = async () => {
-      const nextMessage = pendingQueue.find(m => m.status === 'sending');
-      if (!nextMessage) return;
+    let isProcessingQueue = false;
+    const processingIds = new Set();
 
-      try {
-        const { error } = await supabase.from('mensagens').insert([{
-          sender_code: nextMessage.sender_code,
-          receiver_code: nextMessage.receiver_code,
-          content: nextMessage.content,
-          reply_to_id: nextMessage.reply_to_id
-        }]);
-        if (error) throw error;
-      } catch (err) {
-        setPendingQueue(prev => prev.map(m => m.id === nextMessage.id ? { ...m, status: 'failed' } : m));
+    const queueWorker = async () => {
+      if (isProcessingQueue) return;
+      isProcessingQueue = true;
+
+      const currentQueue = pendingQueueRef.current || [];
+      // Inverte para processar da mensagem mais velha para a mais nova
+      const reversedQueue = [...currentQueue].reverse();
+
+      for (const message of reversedQueue) {
+        if (message.status === 'failed') {
+          // Bloqueio de Segurança: Trava a fila se a mensagem anterior falhou
+          break;
+        }
+
+        if (message.status === 'sending' && !processingIds.has(message.id)) {
+          processingIds.add(message.id);
+          try {
+            const { error } = await supabase.from('mensagens').insert([{
+              sender_code: message.sender_code,
+              receiver_code: message.receiver_code,
+              content: message.content,
+              reply_to_id: message.reply_to_id
+            }]);
+            if (error) throw error;
+          } catch (err) {
+            processingIds.delete(message.id);
+            setPendingQueue(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' } : m));
+            // Aborta para manter a ordem cronológica estrita
+            break; 
+          }
+        }
+      }
+
+      isProcessingQueue = false;
+
+      // Limpeza de memória
+      const currentIds = new Set((pendingQueueRef.current || []).map(m => m.id));
+      for (const id of processingIds) {
+        if (!currentIds.has(id)) processingIds.delete(id);
       }
     };
-    processQueue();
-  }, [pendingQueue]);
 
-  useEffect(() => {
-    const autoRetryInterval = setInterval(() => {
-      setPendingQueue(prev => {
-        const hasFailedMessages = prev.some(m => m.status === 'failed');
-        if (!hasFailedMessages) return prev;
-        return prev.map(m => m.status === 'failed' ? { ...m, status: 'sending' } : m);
-      });
-    }, 6000);
-    return () => clearInterval(autoRetryInterval);
+    const intervalId = setInterval(queueWorker, 1000);
+    queueWorker(); 
+
+    return () => {
+      clearInterval(intervalId);
+      processingIds.clear();
+    };
   }, []);
 
   useEffect(() => {
     const fetchMessages = async () => {
       try {
+        const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
+        const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
+
         const { data, error } = await supabase
           .from('mensagens')
           .select('*')
@@ -131,7 +160,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           .order('created_at', { ascending: false });
 
         if (!error) {
-          setMessages(data || []);
+          const filteredData = (data || []).filter(m => new Date(m.created_at).getTime() > clearedTime);
+          setMessages(filteredData);
           marcarComoLidas();
         }
       } catch (err) { console.error(err); } finally { setLoading(false); }
@@ -147,7 +177,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           if ((newMsg.sender_code === userCode && newMsg.receiver_code === friendCode) || (newMsg.sender_code === friendCode && newMsg.receiver_code === userCode)) {
             setMessages((prev) => [newMsg, ...prev]);
             if (newMsg.sender_code === userCode) {
-              setPendingQueue(prev => prev.filter(m => m.content !== newMsg.content));
+              setPendingQueue(prev => {
+                const matchIndex = prev.findIndex(m => m.content === newMsg.content && m.reply_to_id === newMsg.reply_to_id);
+                if (matchIndex > -1) {
+                  const newQueue = [...prev];
+                  newQueue.splice(matchIndex, 1);
+                  return newQueue;
+                }
+                return prev;
+              });
             }
             if (newMsg.receiver_code === userCode) marcarComoLidas();
           }
@@ -327,7 +365,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const handleClearChat = async () => {
     try {
-      await supabase.from('mensagens').delete().or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`);
+      await AsyncStorage.setItem(`@cleared_${userCode}_${friendCode}`, new Date().toISOString());
       setMessages([]);
       setMenuVisible(false);
     } catch (err) { console.error(err); }
@@ -500,17 +538,17 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <View style={styles.menuDivider} />
             <Text style={styles.menuSectionTitle}>Ações do Chat</Text>
             <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setMediaGalleryVisible(true); }}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Mídias do Chat</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setEditNameVisible(true); }}><Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Editar Nome do Amigo</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setEditNameVisible(true); }}><Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Editar Nome</Text></TouchableOpacity>
             <TouchableOpacity style={styles.menuItem} onPress={handleClearChat}><Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 10 }} /><Text style={[styles.menuItemText, { color: '#ef4444' }]}>Excluir Bate-papo</Text></TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>
 
-      {/* MODAL 2: Editar Nome do Amigo */}
+      {/* MODAL 2: Editar Nome */}
       <Modal animationType="fade" transparent visible={editNameVisible} onRequestClose={() => setEditNameVisible(false)}>
         <View style={styles.modalOverlayDark}>
           <View style={styles.editNameCard}>
-            <Text style={styles.modalTitle}>Alterar Nome do Amigo</Text>
+            <Text style={styles.modalTitle}>Alterar Nome</Text>
             <TextInput style={styles.modalInput} value={newNameInput} onChangeText={setNewNameInput} maxLength={20} autoFocus />
             <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233' }]} onPress={() => setEditNameVisible(false)}><Text style={{ color: '#fff' }}>Cancelar</Text></TouchableOpacity>
