@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "live-weather-01",
+    "name": "Live Weather",
     "slug": "snack-30daa59e-3096-4c16-b6a6-391d610664cd",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -17,13 +17,23 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.liveweather.app"
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "O aplicativo precisa acessar suas fotos para salvar mídias.",
+          "savePhotosPermission": "O aplicativo precisa de permissão para salvar fotos na galeria."
+        }
+      ]
+    ]
   }
 }

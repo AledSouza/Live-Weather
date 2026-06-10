@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextInput, Modal, ActivityIndicator } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -22,6 +22,26 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const [optionsModalVisible, setOptionsModalVisible] = useState(false);
   const [chatOptionTarget, setChatOptionTarget] = useState(null);
 
+  const devClicksRef = useRef(0);
+  const devTimeoutRef = useRef(null);
+
+  const handleAvatarPress = async () => {
+    devClicksRef.current += 1;
+    if (devClicksRef.current >= 15) {
+      const currentMode = await AsyncStorage.getItem('@dev_mode');
+      if (currentMode === 'true') {
+        await AsyncStorage.setItem('@dev_mode', 'false');
+        alert("Modo desenvolvedor desativado.");
+      } else {
+        await AsyncStorage.setItem('@dev_mode', 'true');
+        alert("Modo desenvolvedor ativado!");
+      }
+      devClicksRef.current = 0;
+    }
+    if (devTimeoutRef.current) clearTimeout(devTimeoutRef.current);
+    devTimeoutRef.current = setTimeout(() => { devClicksRef.current = 0; }, 2000);
+  };
+
   // Carrega os canais fixados salvos na memória do celular
   const loadPinnedChats = async () => {
     try {
@@ -36,9 +56,18 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
     try {
       const { data: myConnections } = await supabase.from('conexoes').select('*').eq('user_code', myCleanCode);
-      const { data: incomingMessages } = await supabase.from('mensagens').select('sender_code, read_at').eq('receiver_code', myCleanCode);
+      
+      // Busca todas as mensagens enviadas ou recebidas por você, ordenadas da mais nova para a mais velha
+      const { data: allMessages } = await supabase
+        .from('mensagens')
+        .select('sender_code, receiver_code, content, media_url, media_type, read_at, created_at')
+        .or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`)
+        .order('created_at', { ascending: false });
 
-      const uniqueSenders = [...new Set((incomingMessages || []).map(m => m.sender_code.trim().toLowerCase()))];
+      const messages = allMessages || [];
+      const incomingMessages = messages.filter(m => m.receiver_code.trim().toLowerCase() === myCleanCode);
+
+      const uniqueSenders = [...new Set(incomingMessages.map(m => m.sender_code.trim().toLowerCase()))];
       let incomingProfiles = [];
       if (uniqueSenders.length > 0) {
         const { data: profiles } = await supabase.from('perfis').select('connection_code, nickname').in('connection_code', uniqueSenders);
@@ -47,15 +76,29 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
       const conversationMap = new Map();
 
+      // Função para extrair a prévia da última mensagem
+      const getPreview = (friendCode) => {
+        const chatMsgs = messages.filter(m => 
+          (m.sender_code.trim().toLowerCase() === myCleanCode && m.receiver_code.trim().toLowerCase() === friendCode) || 
+          (m.sender_code.trim().toLowerCase() === friendCode && m.receiver_code.trim().toLowerCase() === myCleanCode)
+        );
+        if (chatMsgs.length === 0) return 'Canal seguro estabelecido';
+        
+        const lastMsg = chatMsgs[0];
+        let prefix = lastMsg.sender_code.trim().toLowerCase() === myCleanCode ? 'Você: ' : '';
+        if (lastMsg.media_url) return prefix + (lastMsg.media_type === 'video' ? '📹 Vídeo' : '📷 Foto');
+        return prefix + lastMsg.content;
+      };
+
       (myConnections || []).forEach(c => {
         const cleanKey = c.friend_code.trim().toLowerCase();
-        const unreadCount = (incomingMessages || []).filter(m => m.sender_code.trim().toLowerCase() === cleanKey && m.read_at === null).length;
+        const unreadCount = incomingMessages.filter(m => m.sender_code.trim().toLowerCase() === cleanKey && m.read_at === null).length;
 
         conversationMap.set(cleanKey, {
           id: c.id,
           token: cleanKey,
           name: c.friend_name,
-          lastMessage: unreadCount > 0 ? '📩 Novas mensagens...' : 'Canal seguro estabelecido',
+          lastMessage: getPreview(cleanKey),
           isConnection: true,
           unread: unreadCount
         });
@@ -64,12 +107,12 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       incomingProfiles.forEach(p => {
         const cleanKey = p.connection_code.trim().toLowerCase();
         if (!conversationMap.has(cleanKey)) {
-          const unreadCount = (incomingMessages || []).filter(m => m.sender_code.trim().toLowerCase() === cleanKey && m.read_at === null).length;
+          const unreadCount = incomingMessages.filter(m => m.sender_code.trim().toLowerCase() === cleanKey && m.read_at === null).length;
           conversationMap.set(cleanKey, {
             id: null,
             token: cleanKey,
             name: p.nickname,
-            lastMessage: '📩 Nova mensagem de terminal recebida...',
+            lastMessage: getPreview(cleanKey),
             isConnection: false,
             unread: unreadCount
           });
@@ -85,14 +128,25 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     fetchMyConversations();
 
     const cleanUserCode = userCode.trim().toLowerCase();
-    const channelMessages = supabase
-      .channel(`chat-list-${cleanUserCode}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'mensagens', filter: `receiver_code=eq.${cleanUserCode}` }, () => {
+    
+    const channelIncoming = supabase
+      .channel(`chat-list-in-${cleanUserCode}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'mensagens', filter: `receiver_code=eq.${cleanUserCode}` }, () => {
+        fetchMyConversations();
+      })
+      .subscribe();
+      
+    const channelOutgoing = supabase
+      .channel(`chat-list-out-${cleanUserCode}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'mensagens', filter: `sender_code=eq.${cleanUserCode}` }, () => {
         fetchMyConversations();
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(channelMessages); };
+    return () => { 
+      supabase.removeChannel(channelIncoming); 
+      supabase.removeChannel(channelOutgoing); 
+    };
   }, [userCode]);
 
   // 🚀 FUNÇÃO: Fixa ou desafixa o chat jogando as flags para a ordenação
@@ -158,7 +212,9 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     <SafeAreaView style={styles.container}>
       <View style={styles.profileSection}>
         <View style={styles.profileLeft}>
-          <View style={styles.myAvatar}><Text style={styles.avatarInitial}>{userNickname?.charAt(0).toUpperCase()}</Text></View>
+          <TouchableOpacity activeOpacity={0.8} onPress={handleAvatarPress} style={styles.myAvatar}>
+            <Text style={styles.avatarInitial}>{userNickname?.charAt(0).toUpperCase()}</Text>
+          </TouchableOpacity>
           <View style={styles.profileInfo}>
             <Text style={styles.myNickname}>{userNickname}</Text>
             <Text style={styles.myCode}>Token: {userCode}</Text>

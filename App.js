@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 // 🚀 CORREÇÃO: Adicionados Text e TouchableOpacity que estavam faltando aqui
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Notifications from 'expo-notifications';
+import * as ScreenCapture from 'expo-screen-capture';
 import { supabase } from './supabase';
 
 // Telas do ecossistema
@@ -12,6 +12,7 @@ import ChatRoomScreen from './screens/ChatRoomScreen';
 
 export default function App() {
   const inactivityTimer = useRef(null);
+  const isPickerActiveRef = useRef(false);
   const [isChatMode, setIsChatMode] = useState(false);
   const [currentScreen, setCurrentScreen] = useState('gateway'); // 'gateway', 'list', 'room'
   const [nickname, setNickname] = useState('');
@@ -32,18 +33,17 @@ export default function App() {
   };
 
   useEffect(() => {
+    // Bloqueia prints e deixa a tela preta na lista de tarefas recentes do Android/iOS
+    ScreenCapture.preventScreenCaptureAsync();
+
     const subscription = AppState.addEventListener('change', nextAppState => {
       if (nextAppState === 'background' || nextAppState === 'inactive') {
-        setIsChatMode(false);
+        if (!isPickerActiveRef.current) {
+          setIsChatMode(false);
+        }
       }
     });
 
-    const registerForPushNotifications = async () => {
-      const { status } = await Notifications.requestPermissionsAsync();
-      if (status !== 'granted') return;
-    };
-    registerForPushNotifications();
-  
     const checkIdentity = async () => {
       try {
         const savedName = await AsyncStorage.getItem('@user_nickname');
@@ -112,6 +112,7 @@ export default function App() {
             userCode={connectionCode}
             friendCode={activeFriendCode}
             friendName={activeFriendName}
+            setPickerActive={(val) => { isPickerActiveRef.current = val; }}
             onBack={() => setCurrentScreen('list')}
           />
         );

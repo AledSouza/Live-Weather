@@ -7,6 +7,8 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { Video, ResizeMode } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../supabase';
 
@@ -38,7 +40,7 @@ const SwipeableMessage = ({ children, onReply }) => {
   );
 };
 
-export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName }) {
+export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive }) {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(true);
@@ -57,6 +59,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [showCustomEmojiInput, setShowCustomEmojiInput] = useState(false);
   const [infoModalMessage, setInfoModalMessage] = useState(null);
   const [mediaGalleryVisible, setMediaGalleryVisible] = useState(false);
+  const [showBlueTicks, setShowBlueTicks] = useState(false);
 
   const [pendingQueue, setPendingQueue] = useState([]);
   const pendingQueueRef = useRef(pendingQueue);
@@ -81,6 +84,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
         const storedQueue = await AsyncStorage.getItem(`@queue_${userCode}_${friendCode}`);
         if (storedQueue) setPendingQueue(JSON.parse(storedQueue));
+
+        const devMode = await AsyncStorage.getItem('@dev_mode');
+        setShowBlueTicks(devMode === 'true');
       } catch (e) { console.error(e); }
     };
     initializeChatState();
@@ -343,12 +349,31 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (err) { alert(`Falha: ${err.message}`); } finally { setUploading(false); }
   };
 
+  const handleDownloadMedia = async (url) => {
+    try {
+      const { status } = await MediaLibrary.requestPermissionsAsync(true);
+      if (status !== 'granted') return alert('Permissão necessária para salvar na galeria.');
+      
+      const filename = url.split('/').pop();
+      const fileUri = `${FileSystem.documentDirectory}${filename}`;
+      
+      const downloadRes = await FileSystem.downloadAsync(url, fileUri);
+      await MediaLibrary.saveToLibraryAsync(downloadRes.uri);
+      alert('Mídia salva na galeria com sucesso!');
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao salvar o arquivo.');
+    }
+  };
+
   const handleSelectMedia = async (type) => {
     setMenuVisible(false);
     try {
       const resPhoto = await ImagePicker.requestMediaLibraryPermissionsAsync();
       const resCam = await ImagePicker.requestCameraPermissionsAsync();
       if (!resPhoto.granted || !resCam.granted) return alert('Permissões necessárias.');
+
+      if (setPickerActive) setPickerActive(true);
 
       let result = null;
         if (type === 'camera_photo') {
@@ -359,10 +384,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 0.5 });
         }
 
+      if (setPickerActive) setPickerActive(false);
+
       if (result && !result.canceled && result.assets && result.assets[0].uri) {
           await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image');
       }
-    } catch (err) { console.error(err); }
+    } catch (err) { 
+      if (setPickerActive) setPickerActive(false);
+      console.error(err); 
+    }
   };
 
   const handleUpdateFriendName = async () => {
@@ -426,7 +456,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
 
-    let statusIcon = <Ionicons name={item.read_at ? 'checkmark-done' : 'checkmark'} size={15} color={item.read_at ? '#00bfff' : '#475569'} style={{ marginLeft: 4 }} />;
+    let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicks ? '#00bfff' : '#475569'} style={{ marginLeft: 4 }} />;
     if (item.status === 'sending') {
       statusIcon = <Ionicons name="time-outline" size={15} color="#64748B" style={{ marginLeft: 4 }} />;
     } else if (item.status === 'failed') {
@@ -483,14 +513,18 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           {item.media_url ? (
             <View>
               {item.media_type === 'video' ? (
-                <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' }]}>
-                  <Ionicons name="videocam-outline" size={48} color="#94A3B8" />
-                  <Ionicons name="play-circle" size={48} color="#fff" style={{ position: 'absolute' }} />
+                <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#1E293B', overflow: 'hidden', justifyContent: 'center', alignItems: 'center' }]}>
+                  <Video source={{ uri: item.media_url }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted={true} />
+                  <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 24 }}><Ionicons name="play-circle" size={48} color="#fff" /></View>
+                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
                 </View>
               ) : (
-                <Image source={{ uri: item.media_url }} style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE }]} resizeMode="cover" />
+                <View style={{ position: 'relative' }}>
+                  <Image source={{ uri: item.media_url }} style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE }]} resizeMode="cover" />
+                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
+                </View>
               )}
-              <View style={[styles.bubbleFooter, { paddingHorizontal: 8, paddingBottom: 6 }]}>
+              <View style={[styles.bubbleFooter, { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4 }]}>
                 <Text style={styles.messageTime}>{timeString}</Text>
                 {isMyMessage && statusIcon}
               </View>
@@ -611,22 +645,25 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       {/* MODAL 3: Detalhes e Autodestruição (Long Press) */}
       <Modal animationType="fade" transparent visible={!!infoModalMessage} onRequestClose={() => setInfoModalMessage(null)}>
         <TouchableOpacity style={styles.modalOverlayDark} activeOpacity={1} onPress={() => setInfoModalMessage(null)}>
-          <View style={styles.editNameCard}>
+          <TouchableOpacity activeOpacity={1} style={styles.editNameCard} onPress={() => {}}>
             <Text style={styles.modalTitle}>Metadados do Arquivo</Text>
             {infoModalMessage && (
               <View style={styles.metaContainer}>
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Registrado em:</Text><Text style={styles.metaValue}>{getMessageLifetime(infoModalMessage.created_at).exato}</Text></View>
-                <View style={styles.metaRow}><Text style={styles.metaLabel}>Autodestruição em:</Text><Text style={[styles.metaValue, { color: '#00ff66', fontWeight: 'bold' }]}>{getMessageLifetime(infoModalMessage.created_at).restante}</Text></View>
+                <View style={styles.metaRow}><Text style={styles.metaLabel}>Apagando em:</Text><Text style={[styles.metaValue, { color: '#00ff66', fontWeight: 'bold' }]}>{getMessageLifetime(infoModalMessage.created_at).restante}</Text></View>
               </View>
             )}
-            {infoModalMessage?.media_url && (
-              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#3b82f6', marginBottom: 15, width: '100%' }]} onPress={() => handleDownloadMedia(infoModalMessage.media_url)}><Text style={{ color: '#fff', fontWeight: 'bold' }}>Baixar Mídia para Galeria</Text></TouchableOpacity>
+            {infoModalMessage?.content && !infoModalMessage?.media_url && (
+              <View style={styles.selectableTextContainer}>
+                <Text selectable={true} style={styles.selectableText}>{infoModalMessage.content}</Text>
+                <Text style={{ color: '#64748B', fontSize: 10, marginTop: 5, textAlign: 'center' }}>Segure no texto acima para selecionar trechos</Text>
+              </View>
             )}
             <View style={styles.modalButtons}>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233' }]} onPress={() => setInfoModalMessage(null)}><Text style={{ color: '#fff' }}>Voltar</Text></TouchableOpacity>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#ef4444' }]} onPress={() => handleDeleteMessage(infoModalMessage.id)}><Text style={{ color: '#fff', fontWeight: 'bold' }}>Excluir para mim</Text></TouchableOpacity>
             </View>
-          </View>
+          </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
 
@@ -687,8 +724,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             renderItem={({ item }) => (
               <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => item.media_type === 'video' ? setFullscreenVideo(item.media_url) : setFullscreenImage(item.media_url)}>
                 {item.media_type === 'video' ? (
-                  <View style={{ width: '100%', height: '100%', borderRadius: 4, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' }}>
-                    <Ionicons name="play" size={28} color="#fff" />
+                  <View style={{ width: '100%', height: '100%', borderRadius: 4, backgroundColor: '#1E293B', overflow: 'hidden', justifyContent: 'center', alignItems: 'center' }}>
+                    <Video source={{ uri: item.media_url }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted={true} />
+                    <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 14 }}><Ionicons name="play" size={28} color="#fff" /></View>
                   </View>
                 ) : (
                   <Image source={{ uri: item.media_url }} style={{ width: '100%', height: '100%', borderRadius: 4 }} />
@@ -758,6 +796,8 @@ const styles = StyleSheet.create({
   metaLabel: { color: '#64748B', fontSize: 13 },
   metaValue: { color: '#fff', fontSize: 13, fontFamily: 'monospace' },
   modalButtons: { flexDirection: 'row', justifyContent: 'space-between', gap: 10 },
+  selectableTextContainer: { backgroundColor: '#111827', padding: 15, borderRadius: 12, marginBottom: 15, borderWidth: 1, borderColor: '#1F2937', maxHeight: 150 },
+  selectableText: { color: '#fff', fontSize: 15, lineHeight: 22 },
   fullscreenOverlay: { flex: 1, backgroundColor: 'black', justifyContent: 'center', alignItems: 'center' },
   fullscreenImage: { width: '100%', height: '100%' },
   closeFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 20, zIndex: 99, elevation: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 },
