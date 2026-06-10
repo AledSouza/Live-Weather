@@ -17,6 +17,7 @@
     "expo-image-picker": "~17.0.11",
     "expo-media-library": "~18.2.1",
     "expo-notifications": "~0.32.17",
+    "expo-av": "~15.0.2",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",
     "react-dom": "19.1.0",

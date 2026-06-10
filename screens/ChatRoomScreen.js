@@ -6,6 +6,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
+import { Video, ResizeMode } from 'expo-av';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../supabase';
 
@@ -49,6 +50,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [newNameInput, setNewNameInput] = useState(friendName);
   const [replyingTo, setReplyingTo] = useState(null);
   const [fullscreenImage, setFullscreenImage] = useState(null);
+  const [fullscreenVideo, setFullscreenVideo] = useState(null);
 
   const [isFriendTyping, setIsFriendTyping] = useState(false);
   const [reactionTargetMessage, setReactionTargetMessage] = useState(null);
@@ -59,6 +61,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [pendingQueue, setPendingQueue] = useState([]);
   const pendingQueueRef = useRef(pendingQueue);
   pendingQueueRef.current = pendingQueue;
+  const lastMessageTimeRef = useRef(Date.now());
 
   const shortTimer = useRef(null);
   const longTimer = useRef(null);
@@ -117,7 +120,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               sender_code: message.sender_code,
               receiver_code: message.receiver_code,
               content: message.content,
-              reply_to_id: message.reply_to_id
+              reply_to_id: message.reply_to_id,
+              created_at: message.created_at
             }]);
             if (error) throw error;
           } catch (err) {
@@ -175,10 +179,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         if (payload.eventType === 'INSERT') {
           const newMsg = payload.new;
           if ((newMsg.sender_code === userCode && newMsg.receiver_code === friendCode) || (newMsg.sender_code === friendCode && newMsg.receiver_code === userCode)) {
-            setMessages((prev) => [newMsg, ...prev]);
+            setMessages((prev) => {
+              if (prev.some(m => m.id === newMsg.id)) return prev;
+              const updated = [newMsg, ...prev];
+              return updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+            });
             if (newMsg.sender_code === userCode) {
               setPendingQueue(prev => {
-                const matchIndex = prev.findIndex(m => m.content === newMsg.content && m.reply_to_id === newMsg.reply_to_id);
+                const matchIndex = prev.findIndex(m => new Date(m.created_at).getTime() === new Date(newMsg.created_at).getTime());
                 if (matchIndex > -1) {
                   const newQueue = [...prev];
                   newQueue.splice(matchIndex, 1);
@@ -239,13 +247,19 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
     channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { sender: userCode, isTyping: false } });
 
+    let newTime = Date.now();
+    if (newTime <= lastMessageTimeRef.current) {
+      newTime = lastMessageTimeRef.current + 1;
+    }
+    lastMessageTimeRef.current = newTime;
+
     const newPendingMessage = {
-      id: `pending-${Date.now()}-${Math.random()}`,
+      id: `pending-${newTime}-${Math.random()}`,
       content: messageContent,
       sender_code: userCode,
       receiver_code: friendCode,
       reply_to_id: currentReplyId,
-      created_at: new Date().toISOString(),
+      created_at: new Date(newTime).toISOString(),
       status: 'sending'
     };
 
@@ -337,8 +351,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       if (!resPhoto.granted || !resCam.granted) return alert('Permissões necessárias.');
 
       let result = null;
-        if (type === 'camera') result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsEditing: true, quality: 0.5 });
-        else if (type === 'gallery_photo') result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 0.5 });
+        if (type === 'camera_photo') {
+          result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: true, quality: 0.5 });
+        } else if (type === 'camera_video') {
+          result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Videos, allowsEditing: true, quality: 0.5 });
+        } else if (type === 'gallery') {
+          result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 0.5 });
+        }
 
       if (result && !result.canceled && result.assets && result.assets[0].uri) {
           await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image');
@@ -365,10 +384,40 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const handleClearChat = async () => {
     try {
-      await AsyncStorage.setItem(`@cleared_${userCode}_${friendCode}`, new Date().toISOString());
+      // Extrai o nome dos arquivos (fotos/vídeos) e os apaga do balde de armazenamento
+      const mediaMessages = messages.filter(m => m.media_url);
+      if (mediaMessages.length > 0) {
+        const filesToDelete = mediaMessages.map(m => m.media_url.split('/').pop());
+        await supabase.storage.from('chat-media').remove(filesToDelete);
+      }
+      
+      // Deleta definitivamente as mensagens do banco de dados (para os dois usuários)
+      await supabase.from('mensagens').delete().or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`);
       setMessages([]);
       setMenuVisible(false);
     } catch (err) { console.error(err); }
+  };
+
+  // Função que converte as URLs dentro do texto em Links azuis clicáveis
+  const renderMessageText = (text, isFailed) => {
+    if (!text) return null;
+    const urlRegex = /(https?:\/\/[^\s]+)/g;
+    const parts = text.split(urlRegex);
+    
+    return (
+      <Text style={[styles.messageText, isFailed && { color: '#94a3b8' }]}>
+        {parts.map((part, index) => {
+          if (part.match(urlRegex)) {
+            return (
+              <Text key={index} style={{ color: '#00bfff', textDecorationLine: 'underline' }} onPress={() => Linking.openURL(part).catch(() => alert('Não foi possível abrir o link.'))}>
+                {part}
+              </Text>
+            );
+          }
+          return <Text key={index}>{part}</Text>;
+        })}
+      </Text>
+    );
   };
 
   const renderItem = ({ item }) => {
@@ -414,7 +463,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 forceManualRetry(item.id);
               } else if (item.media_url) {
                 if (item.media_type === 'video') {
-                  Linking.openURL(item.media_url).catch(() => alert('Não foi possível abrir o vídeo.'));
+                  setFullscreenVideo(item.media_url);
                 } else {
                   setFullscreenImage(item.media_url);
                 }
@@ -448,7 +497,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             </View>
           ) : (
             <>
-              <Text style={[styles.messageText, item.status === 'failed' && { color: '#94a3b8' }]}>{item.content}</Text>
+              {renderMessageText(item.content, item.status === 'failed')}
               <View style={styles.bubbleFooter}>
                 <Text style={styles.messageTime}>{timeString}</Text>
                 {isMyMessage && statusIcon}
@@ -533,8 +582,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setMenuVisible(false)}>
           <View style={[styles.menuContent, { width: Math.min(SCREEN_WIDTH * 0.85, 320) }]}>
             <Text style={styles.menuSectionTitle}>Enviar Mídia</Text>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera')}><Ionicons name="camera-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Tirar Foto/Vídeo</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('gallery_photo')}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Escolher Foto/Vídeo</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Tirar Foto</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Gravar Vídeo</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('gallery')}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Escolher da Galeria</Text></TouchableOpacity>
             <View style={styles.menuDivider} />
             <Text style={styles.menuSectionTitle}>Ações do Chat</Text>
             <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setMediaGalleryVisible(true); }}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Mídias do Chat</Text></TouchableOpacity>
@@ -568,6 +618,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Registrado em:</Text><Text style={styles.metaValue}>{getMessageLifetime(infoModalMessage.created_at).exato}</Text></View>
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Autodestruição em:</Text><Text style={[styles.metaValue, { color: '#00ff66', fontWeight: 'bold' }]}>{getMessageLifetime(infoModalMessage.created_at).restante}</Text></View>
               </View>
+            )}
+            {infoModalMessage?.media_url && (
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#3b82f6', marginBottom: 15, width: '100%' }]} onPress={() => handleDownloadMedia(infoModalMessage.media_url)}><Text style={{ color: '#fff', fontWeight: 'bold' }}>Baixar Mídia para Galeria</Text></TouchableOpacity>
             )}
             <View style={styles.modalButtons}>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233' }]} onPress={() => setInfoModalMessage(null)}><Text style={{ color: '#fff' }}>Voltar</Text></TouchableOpacity>
@@ -603,6 +656,22 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         </View>
       </Modal>
 
+      {/* MODAL 7: Video em Tela Cheia */}
+      <Modal animationType="fade" transparent visible={!!fullscreenVideo} onRequestClose={() => setFullscreenVideo(null)}>
+        <View style={styles.fullscreenOverlay}>
+          <TouchableOpacity style={styles.closeFullscreenBtn} onPress={() => setFullscreenVideo(null)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
+          {fullscreenVideo && (
+            <Video
+              style={styles.fullscreenImage}
+              source={{ uri: fullscreenVideo }}
+              useNativeControls
+              resizeMode={ResizeMode.CONTAIN}
+              shouldPlay
+            />
+          )}
+        </View>
+      </Modal>
+
       {/* MODAL 6: Mídias do Chat */}
       <Modal animationType="slide" transparent visible={mediaGalleryVisible} onRequestClose={() => setMediaGalleryVisible(false)}>
         <SafeAreaView style={[styles.mainContainer, { paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0 }]}>
@@ -616,7 +685,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             numColumns={3}
             contentContainerStyle={{ padding: 4 }}
             renderItem={({ item }) => (
-              <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => item.media_type === 'video' ? Linking.openURL(item.media_url).catch(() => alert('Não foi possível abrir o vídeo.')) : setFullscreenImage(item.media_url)}>
+              <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => item.media_type === 'video' ? setFullscreenVideo(item.media_url) : setFullscreenImage(item.media_url)}>
                 {item.media_type === 'video' ? (
                   <View style={{ width: '100%', height: '100%', borderRadius: 4, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' }}>
                     <Ionicons name="play" size={28} color="#fff" />
@@ -691,5 +760,12 @@ const styles = StyleSheet.create({
   modalButtons: { flexDirection: 'row', justifyContent: 'space-between', gap: 10 },
   fullscreenOverlay: { flex: 1, backgroundColor: 'black', justifyContent: 'center', alignItems: 'center' },
   fullscreenImage: { width: '100%', height: '100%' },
-  closeFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 20, zIndex: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 }
+  closeFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 20, zIndex: 99, elevation: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 },
+  downloadFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 80, zIndex: 99, elevation: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 },
+  downloadBtn: { position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.5)', padding: 6, borderRadius: 16, zIndex: 10, elevation: 10 },
+  linkPreviewContainer: { backgroundColor: '#111827', borderRadius: 8, marginTop: 8, overflow: 'hidden', borderWidth: 1, borderColor: '#1F2937' },
+  linkPreviewImage: { width: '100%', height: 120, backgroundColor: '#1e293b' },
+  linkPreviewTextContainer: { padding: 10 },
+  linkPreviewTitle: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 4 },
+  linkPreviewDesc: { color: '#94A3B8', fontSize: 12 }
 });

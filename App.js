@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 // 🚀 CORREÇÃO: Adicionados Text e TouchableOpacity que estavam faltando aqui
-import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput } from 'react-native';
+import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import { supabase } from './supabase';
@@ -11,6 +11,7 @@ import ChatListScreen from './screens/ChatListScreen';
 import ChatRoomScreen from './screens/ChatRoomScreen';
 
 export default function App() {
+  const inactivityTimer = useRef(null);
   const [isChatMode, setIsChatMode] = useState(false);
   const [currentScreen, setCurrentScreen] = useState('gateway'); // 'gateway', 'list', 'room'
   const [nickname, setNickname] = useState('');
@@ -22,7 +23,21 @@ export default function App() {
   const [activeFriendCode, setActiveFriendCode] = useState(null);
   const [activeFriendName, setActiveFriendName] = useState(null);
 
+  // Função que renova o tempo sempre que a tela é tocada
+  const resetInactivityTimer = () => {
+    if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    inactivityTimer.current = setTimeout(() => {
+      setIsChatMode(false);
+    }, 120000); // Bloqueia após 2 minutos sem tocar na tela
+  };
+
   useEffect(() => {
+    const subscription = AppState.addEventListener('change', nextAppState => {
+      if (nextAppState === 'background' || nextAppState === 'inactive') {
+        setIsChatMode(false);
+      }
+    });
+
     const registerForPushNotifications = async () => {
       const { status } = await Notifications.requestPermissionsAsync();
       if (status !== 'granted') return;
@@ -46,6 +61,11 @@ export default function App() {
       }
     };
     checkIdentity();
+
+    return () => {
+      subscription.remove();
+      if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
+    };
   }, []);
 
   const handleUnlockTrigger = () => {
@@ -147,7 +167,7 @@ export default function App() {
   }
 
   return (
-    <View style={styles.globalRoot}>
+    <View style={styles.globalRoot} onTouchStart={resetInactivityTimer}>
       <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" translucent />
       {renderScreen()}
     </View>
