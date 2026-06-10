@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity,
-  SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform,
+  SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform, Linking,
   StatusBar, Modal, Image, Animated, PanResponder, useWindowDimensions
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -263,23 +263,28 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (err) { console.error(err); }
   };
 
-  const handleUploadAndSendMedia = async (uri, mediaType, base64Data) => {
+  const handleUploadAndSendMedia = async (uri, mediaType) => {
     try {
       setUploading(true);
       const tempId = `temp-${Date.now()}`;
       setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date().toISOString(), is_uploading: true }, ...prev]);
 
-      const filename = `${userCode}-${Date.now()}.jpg`;
-      if (!base64Data) throw new Error("O Snack não suporta vídeos.");
+      const ext = mediaType === 'video' ? 'mp4' : 'jpg';
+      const filename = `${userCode}-${Date.now()}.${ext}`;
+      const mimeType = mediaType === 'video' ? 'video/mp4' : 'image/jpeg';
 
-      const response = await fetch(`data:image/jpeg;base64,${base64Data}`);
-      const arrayBuffer = await response.arrayBuffer();
+      const formData = new FormData();
+      formData.append('file', {
+        uri: uri,
+        name: filename,
+        type: mimeType,
+      });
 
-      const { error: uploadError } = await supabase.storage.from('chat-media').upload(filename, arrayBuffer, { contentType: 'image/jpeg', upsert: true });
+      const { error: uploadError } = await supabase.storage.from('chat-media').upload(filename, formData);
       if (uploadError) throw uploadError;
 
       const mediaUrl = `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
-      await supabase.from('mensagens').insert([{ sender_code: userCode, receiver_code: friendCode, content: '📩 Arquivo de mídia enviado', media_url: mediaUrl, media_type: mediaType, reply_to_id: replyingTo?.id }]);
+      await supabase.from('mensagens').insert([{ sender_code: userCode, receiver_code: friendCode, content: mediaType === 'video' ? '📹 Vídeo enviado' : '📩 Arquivo de mídia enviado', media_url: mediaUrl, media_type: mediaType, reply_to_id: replyingTo?.id }]);
 
       setMessages((prev) => prev.filter(msg => msg.id !== tempId));
       setReplyingTo(null);
@@ -294,11 +299,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       if (!resPhoto.granted || !resCam.granted) return alert('Permissões necessárias.');
 
       let result = null;
-      if (type === 'camera') result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: true, quality: 0.5, base64: true });
-      else if (type === 'gallery_photo') result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsMultipleSelection: false, quality: 0.5, base64: true });
+        if (type === 'camera') result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsEditing: true, quality: 0.5 });
+        else if (type === 'gallery_photo') result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 0.5 });
 
       if (result && !result.canceled && result.assets && result.assets[0].uri) {
-        await handleUploadAndSendMedia(result.assets[0].uri, 'image', result.assets[0].base64 || null);
+          await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image');
       }
     } catch (err) { console.error(err); }
   };
@@ -370,7 +375,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               if (item.status === 'failed') {
                 forceManualRetry(item.id);
               } else if (item.media_url) {
-                setFullscreenImage(item.media_url);
+                if (item.media_type === 'video') {
+                  Linking.openURL(item.media_url).catch(() => alert('Não foi possível abrir o vídeo.'));
+                } else {
+                  setFullscreenImage(item.media_url);
+                }
               } else {
                 setReplyingTo(item);
               }
@@ -386,7 +395,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
           {item.media_url ? (
             <View>
-              <Image source={{ uri: item.media_url }} style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE }]} resizeMode="cover" />
+              {item.media_type === 'video' ? (
+                <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' }]}>
+                  <Ionicons name="videocam-outline" size={48} color="#94A3B8" />
+                  <Ionicons name="play-circle" size={48} color="#fff" style={{ position: 'absolute' }} />
+                </View>
+              ) : (
+                <Image source={{ uri: item.media_url }} style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE }]} resizeMode="cover" />
+              )}
               <View style={[styles.bubbleFooter, { paddingHorizontal: 8, paddingBottom: 6 }]}>
                 <Text style={styles.messageTime}>{timeString}</Text>
                 {isMyMessage && statusIcon}
@@ -479,8 +495,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setMenuVisible(false)}>
           <View style={[styles.menuContent, { width: Math.min(SCREEN_WIDTH * 0.85, 320) }]}>
             <Text style={styles.menuSectionTitle}>Enviar Mídia</Text>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera')}><Ionicons name="camera-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Tirar Foto</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('gallery_photo')}><Ionicons name="image-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Escolher Foto</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera')}><Ionicons name="camera-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Tirar Foto/Vídeo</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('gallery_photo')}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Escolher Foto/Vídeo</Text></TouchableOpacity>
             <View style={styles.menuDivider} />
             <Text style={styles.menuSectionTitle}>Ações do Chat</Text>
             <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setMediaGalleryVisible(true); }}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Mídias do Chat</Text></TouchableOpacity>
@@ -562,8 +578,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             numColumns={3}
             contentContainerStyle={{ padding: 4 }}
             renderItem={({ item }) => (
-              <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => setFullscreenImage(item.media_url)}>
-                <Image source={{ uri: item.media_url }} style={{ width: '100%', height: '100%', borderRadius: 4 }} />
+              <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => item.media_type === 'video' ? Linking.openURL(item.media_url).catch(() => alert('Não foi possível abrir o vídeo.')) : setFullscreenImage(item.media_url)}>
+                {item.media_type === 'video' ? (
+                  <View style={{ width: '100%', height: '100%', borderRadius: 4, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' }}>
+                    <Ionicons name="play" size={28} color="#fff" />
+                  </View>
+                ) : (
+                  <Image source={{ uri: item.media_url }} style={{ width: '100%', height: '100%', borderRadius: 4 }} />
+                )}
               </TouchableOpacity>
             )}
             ListEmptyComponent={() => (
