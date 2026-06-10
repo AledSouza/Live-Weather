@@ -18,7 +18,7 @@ export default function WeatherScreen({ onUnlock }) {
     const loadSavedCity = async () => {
       try {
         const savedCity = await AsyncStorage.getItem('@user_city');
-        fetchWeather(savedCity || 'Duque de Caxias');
+        fetchWeather(savedCity || 'São Bernardo do Campo');
       } catch (e) {
         setLoading(false);
       }
@@ -126,7 +126,6 @@ export default function WeatherScreen({ onUnlock }) {
         >
           <View style={styles.header}>
             <Text style={styles.city}>{weatherData.name}</Text>
-            <Text style={styles.date}>Localização configurada</Text>
           </View>
 
           <View style={styles.main}>
@@ -162,7 +161,7 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0B131F', padding: 20 },
   searchBox: { marginTop: Platform.OS === 'ios' ? 50 : 40, marginBottom: 10, zIndex: 50 },
   searchContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#152233', borderRadius: 12, paddingHorizontal: 15, height: 50, borderWidth: 1, borderColor: '#23354D' },
-  input: { flex: 1, color: '#fff', fontSize: 16, outlineStyle: 'none' },
+  input: { flex: 1, color: '#fff', fontSize: 16 },
   suggestionsContainer: { backgroundColor: '#152233', borderRadius: 12, position: 'absolute', top: 55, left: 0, right: 0, borderWidth: 1, borderColor: '#23354D', zIndex: 99 },
   suggestionItem: { flexDirection: 'row', alignItems: 'center', padding: 15, borderBottomWidth: 1, borderBottomColor: '#23354D' },
   suggestionText: { color: '#fff', fontSize: 16 },

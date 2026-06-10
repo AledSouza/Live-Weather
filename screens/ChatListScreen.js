@@ -177,7 +177,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         <FlatList
           data={processedChats}
           keyExtractor={(item) => item.token}
-          contentContainerStyle={{ paddingHorizontal: 20 }}
+          contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 100 }}
           renderItem={({ item }) => (
             <TouchableOpacity 
               style={styles.chatCard} 

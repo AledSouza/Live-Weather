@@ -415,7 +415,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   return (
     <SafeAreaView style={styles.mainContainer}>
       <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <KeyboardAvoidingView 
+        style={{ flex: 1 }} 
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'android' ? StatusBar.currentHeight : 0}
+      >
         
         <View style={styles.chatHeader}>
           <TouchableOpacity onPress={onBack} style={styles.backBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
@@ -574,7 +578,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 }
 
 const styles = StyleSheet.create({
-  mainContainer: { flex: 1, backgroundColor: '#050505', paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0 },
+  mainContainer: { flex: 1, backgroundColor: '#050505' },
   chatHeader: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 15, paddingVertical: 10, backgroundColor: '#0d0d0d', borderBottomWidth: 1, borderBottomColor: '#111', minHeight: 65 },
   backBtn: { paddingRight: 12 },
   menuBtn: { padding: 5 },
@@ -604,7 +608,7 @@ const styles = StyleSheet.create({
   replyBarLeft: { borderLeftWidth: 3, borderLeftColor: '#00ff66', paddingLeft: 10, flex: 1 },
   replyUserTarget: { color: '#00ff66', fontSize: 12, fontWeight: 'bold' },
   replyTextTarget: { color: '#64748B', fontSize: 13, marginTop: 2 },
-  inputWrapper: { backgroundColor: '#0d0d0d', borderTopWidth: 1, borderTopColor: '#111', paddingBottom: Platform.OS === 'android' ? 24 : 24, paddingTop: 10 },
+  inputWrapper: { backgroundColor: '#0d0d0d', borderTopWidth: 1, borderTopColor: '#111', paddingBottom: Platform.OS === 'ios' ? 10 : 48, paddingTop: 10 },
   inputContainer: { flexDirection: 'row', alignItems: 'flex-end', paddingHorizontal: 12 },
   attachBtn: { padding: 8, marginRight: 4, marginBottom: 2 },
   textInput: { flex: 1, minHeight: 42, width: 0, backgroundColor: '#111827', color: '#fff', borderRadius: 22, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10, fontSize: 15, maxHeight: 120, marginRight: 10, textAlignVertical: 'center' },
