@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 // 🚀 CORREÇÃO: Adicionados Text e TouchableOpacity que estavam faltando aqui
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as ScreenCapture from 'expo-screen-capture';
 import { supabase } from './supabase';
 
 // Telas do ecossistema
@@ -33,8 +32,6 @@ export default function App() {
   };
 
   useEffect(() => {
-    // Bloqueia prints e deixa a tela preta na lista de tarefas recentes do Android/iOS
-    ScreenCapture.preventScreenCaptureAsync();
 
     const subscription = AppState.addEventListener('change', nextAppState => {
       if (nextAppState === 'background' || nextAppState === 'inactive') {

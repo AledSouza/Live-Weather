@@ -6,9 +6,9 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -34,6 +34,11 @@
           "savePhotosPermission": "O aplicativo precisa de permissão para salvar fotos na galeria."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "c87c4052-75aa-418a-8fb8-45a32a5bfa38"
+      }
+    }
   }
 }

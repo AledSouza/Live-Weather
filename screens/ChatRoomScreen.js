@@ -7,7 +7,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { Video, ResizeMode } from 'expo-av';
-import * as FileSystem from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase } from '../supabase';
@@ -605,7 +605,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <TouchableOpacity onPress={() => setMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="attach-outline" size={22} color="#64748B" />
             </TouchableOpacity>
-            <TextInput style={styles.textInput} placeholder="Criptografar..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
+            <TextInput style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
             <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
           </View>
         </View>
