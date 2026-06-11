@@ -50,7 +50,7 @@ export default function WeatherScreen({ onUnlock }) {
           for (const item of fData.list) {
             const dateStr = item.dt_txt.split(' ')[0];
             if (!dailyData[dateStr]) {
-              dailyData[dateStr] = { dt: item.dt, min: item.main.temp_min, max: item.main.temp_max, icon: item.weather[0].icon };
+              dailyData[dateStr] = { dateStr, dt: item.dt, min: item.main.temp_min, max: item.main.temp_max, icon: item.weather[0].icon };
             } else {
               dailyData[dateStr].min = Math.min(dailyData[dateStr].min, item.main.temp_min);
               dailyData[dateStr].max = Math.max(dailyData[dateStr].max, item.main.temp_max);
@@ -193,7 +193,8 @@ export default function WeatherScreen({ onUnlock }) {
               <ScrollView horizontal showsHorizontalScrollIndicator={true} contentContainerStyle={styles.forecastScroll}>
                 {forecastData.map((item, index) => {
                   const days = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
-                  const date = new Date(item.dt * 1000);
+                  // Adicionamos T12:00:00 para evitar que o fuso horário empurre a data para o dia anterior no Brasil
+                  const date = new Date(item.dateStr + 'T12:00:00');
                   const dayName = days[date.getDay()];
                   
                   const iconCode = item.icon;

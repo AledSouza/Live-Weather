@@ -3,6 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ScreenCapture from 'expo-screen-capture';
+// import { OneSignal } from 'react-native-onesignal';
 import { supabase } from './supabase';
 
 // Telas do ecossistema
@@ -33,6 +34,22 @@ export default function App() {
   };
 
   useEffect(() => {
+
+    // // Inicializa o OneSignal
+    // OneSignal.initialize("f6b40ba3-e554-4c9d-9f50-24e80b23ffd7");
+    // OneSignal.Notifications.requestPermission(true);
+
+    // Controla o estado de In/Out de Notificações com padrão desativado
+    const initNotif = async () => {
+      const isEnabled = await AsyncStorage.getItem('@notifications_enabled');
+      if (isEnabled === 'true') {
+        // OneSignal.User.pushSubscription.optIn();
+      } else {
+        // OneSignal.User.pushSubscription.optOut();
+        if (isEnabled === null) await AsyncStorage.setItem('@notifications_enabled', 'false');
+      }
+    };
+    initNotif();
 
     // Previne capturas de tela e oculta o conteúdo do app no multitarefas (Recentes)
     const secureScreen = async () => {
@@ -88,12 +105,24 @@ export default function App() {
       const part2 = Math.random().toString(36).substr(2, 4);
       const generatedCode = `${part1}-${part2}`.toLowerCase();
 
+      let osId = null;
+      try {
+        // osId = await OneSignal.User.pushSubscription.getIdAsync();
+      } catch (err) {
+        console.warn('Erro ao obter OneSignal ID:', err);
+      }
+
+      // Só adiciona o onesignal_id se ele não for nulo, evitando quebrar restrições do banco
+      const novoPerfil = { nickname: nickname.trim(), connection_code: generatedCode };
+      if (osId) novoPerfil.onesignal_id = osId;
+
       const { error } = await supabase
         .from('perfis')
-        .insert([{ nickname: nickname.trim(), connection_code: generatedCode }]);
+        .insert([novoPerfil]);
 
       if (error) {
-        alert('Erro ao registrar terminal no servidor.');
+        alert('Falha no Supabase: ' + error.message);
+        console.error('Erro detalhado:', error);
         setSyncing(false);
         return;
       }

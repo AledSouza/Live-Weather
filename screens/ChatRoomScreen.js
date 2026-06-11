@@ -11,7 +11,9 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+// import { OneSignal } from 'react-native-onesignal';
 import { supabase } from '../supabase';
+import { sendWeatherNotification } from './notificationService';
 
 const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ6bWh2aW5tYXZ3Z3RnbHJocW1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEwNTA0NTcsImV4cCI6MjA5NjYyNjQ1N30.Yp6w81vNORd7sKguYV7x6kl476KJoMbl5es1GdwjpLc';
@@ -41,19 +43,29 @@ const SwipeableMessage = ({ children, onReply }) => {
   const pan = useRef(new Animated.Value(0)).current;
   const panResponder = useRef(
     PanResponder.create({
-      onMoveShouldSetPanResponder: (_, gestureState) => Math.abs(gestureState.dx) > 20 && Math.abs(gestureState.dy) < 10,
-      onPanResponderMove: (_, gestureState) => { if (gestureState.dx > 0) pan.setValue(gestureState.dx); },
+      // 🚀 TRAVA RIGOROSA: Ignora qualquer arraste se o dedo se mover na vertical (rolagem de tela)
+      onMoveShouldSetPanResponder: (_, gestureState) => gestureState.dx > 25 && Math.abs(gestureState.dy) < 15,
+      onPanResponderMove: (_, gestureState) => { 
+        // Efeito de fricção (elástico): a mensagem move menos que o dedo, exigindo intenção real
+        if (gestureState.dx > 0) pan.setValue(gestureState.dx * 0.45); 
+      },
       onPanResponderRelease: (_, gestureState) => {
         if (gestureState.dx > 70) onReply();
-        Animated.spring(pan, { toValue: 0, useNativeDriver: true }).start();
+        // Volta rápida e fluida (efeito mola)
+        Animated.spring(pan, { toValue: 0, friction: 6, tension: 40, useNativeDriver: true }).start();
       }
     })
   ).current;
 
   return (
     <View style={styles.swipeContainer}>
-      <Animated.View style={[styles.replyIconLeft, { opacity: pan.interpolate({ inputRange: [0, 60], outputRange: [0, 1] }) }]}>
-        <Ionicons name="arrow-undo" size={16} color="#00ff66" />
+      <Animated.View style={[styles.replyIconLeft, { 
+        opacity: pan.interpolate({ inputRange: [0, 15], outputRange: [0, 1], extrapolate: 'clamp' }),
+        transform: [{ scale: pan.interpolate({ inputRange: [0, 25], outputRange: [0.3, 1], extrapolate: 'clamp' }) }]
+      }]}>
+        <View style={{ backgroundColor: 'rgba(0,255,102,0.15)', padding: 6, borderRadius: 20 }}>
+          <Ionicons name="arrow-undo" size={14} color="#00ff66" />
+        </View>
       </Animated.View>
       <Animated.View style={{ transform: [{ translateX: pan }], width: '100%' }} {...panResponder.panHandlers}>
         {children}
@@ -65,11 +77,13 @@ const SwipeableMessage = ({ children, onReply }) => {
 export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive }) {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
+  const inputTextRef = useRef(''); // 🚀 Captura instantânea do texto para evitar perda de palavras
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
 
   const [currentFriendName, setCurrentFriendName] = useState(friendName);
-  const [menuVisible, setMenuVisible] = useState(false);
+  const [topMenuVisible, setTopMenuVisible] = useState(false);
+  const [attachMenuVisible, setAttachMenuVisible] = useState(false);
   const [editNameVisible, setEditNameVisible] = useState(false);
   const [newNameInput, setNewNameInput] = useState(friendName);
   const [replyingTo, setReplyingTo] = useState(null);
@@ -82,6 +96,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [infoModalMessage, setInfoModalMessage] = useState(null);
   const [mediaGalleryVisible, setMediaGalleryVisible] = useState(false);
   const [showBlueTicks, setShowBlueTicks] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
   const [pendingQueue, setPendingQueue] = useState([]);
   const pendingQueueRef = useRef(pendingQueue);
@@ -92,6 +107,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const longTimer = useRef(null);
   const hasTriggeredShort = useRef(false);
   const hasTriggeredLong = useRef(false);
+  const touchStartX = useRef(0);
+  const touchStartY = useRef(0);
+  const isScrolling = useRef(false);
 
   const flatListRef = useRef();
   const channelRef = useRef(null);
@@ -103,7 +121,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const initializeChatState = async () => {
       try {
         const savedDraft = await AsyncStorage.getItem(`@draft_${userCode}_${friendCode}`);
-        if (savedDraft) setInputText(savedDraft);
+        if (savedDraft) {
+          setInputText(savedDraft);
+          inputTextRef.current = savedDraft; // 🚀 Sincroniza a referência
+        }
 
         const storedQueue = await AsyncStorage.getItem(`@queue_${userCode}_${friendCode}`);
         if (storedQueue) setPendingQueue(JSON.parse(storedQueue));
@@ -137,28 +158,51 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       const reversedQueue = [...currentQueue].reverse();
 
       for (const message of reversedQueue) {
-        if (message.status === 'failed') {
-          // Bloqueio de Segurança: Trava a fila se a mensagem anterior falhou
-          break;
-        }
-
-        if (message.status === 'sending' && !processingIds.has(message.id)) {
+        if (!processingIds.has(message.id)) {
           processingIds.add(message.id);
           try {
-            const { error } = await supabase.from('mensagens').insert([{
+            // 🚀 FEEDBACK VISUAL: Se estava falha e a net voltar, o app muda pro reloginho sozinho
+            if (message.status === 'failed') {
+              setPendingQueue(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sending' } : m));
+            }
+
+            const insertPromise = supabase.from('mensagens').insert([{
               sender_code: message.sender_code,
               receiver_code: message.receiver_code,
               content: message.content,
               reply_to_id: message.reply_to_id,
               created_at: message.created_at
-            }]);
+            }]).select().single();
+
+            // 🚀 TIMEOUT DE 15 SEGS: Impede que a fila trave para sempre se a internet cair silenciosamente
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout de rede')), 15000));
+            
+            const { data, error } = await Promise.race([insertPromise, timeoutPromise]);
             if (error) throw error;
+            
+            // 🚀 SUCESSO ABSOLUTO! Remove da fila e transfere para a tela de chat na hora
+            setPendingQueue(prev => prev.filter(m => m.id !== message.id));
+            setMessages(prev => {
+              if (prev.some(m => m.id === data.id)) return prev;
+              const updated = [data, ...prev].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+              AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(updated.slice(0, 60))).catch(() => {});
+              return updated;
+            });
+
+            // 🚀 Aciona notificação somente quando a mensagem realmente chegar ao servidor
+            sendWeatherNotification(userCode, friendCode);
           } catch (err) {
             processingIds.delete(message.id);
-            setPendingQueue(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' } : m));
+            // Muda para falha apenas se já não estiver marcado como falha (evita piscar a tela)
+            if (message.status !== 'failed') {
+              setPendingQueue(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' } : m));
+            }
             // Aborta para manter a ordem cronológica estrita
             break; 
           }
+        } else {
+          // Trava a fila se a mensagem atual ainda está aguardando confirmação do servidor
+          break;
         }
       }
 
@@ -182,6 +226,12 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   useEffect(() => {
     const fetchMessages = async () => {
+      // 🚀 CACHE: Carrega mensagens da memória para não deixar a tela vazia sem internet
+      try {
+        const cached = await AsyncStorage.getItem(`@cache_msgs_${userCode}_${friendCode}`);
+        if (cached) setMessages(JSON.parse(cached));
+      } catch (e) {}
+
       try {
         const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
         const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
@@ -195,6 +245,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         if (!error) {
           const filteredData = (data || []).filter(m => new Date(m.created_at).getTime() > clearedTime);
           setMessages(filteredData);
+          AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(filteredData.slice(0, 60))).catch(() => {});
           marcarComoLidas();
         }
       } catch (err) { console.error(err); } finally { setLoading(false); }
@@ -211,7 +262,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             setMessages((prev) => {
               if (prev.some(m => m.id === newMsg.id)) return prev;
               const updated = [newMsg, ...prev];
-              return updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+              const finalSorted = updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+              AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(finalSorted.slice(0, 60))).catch(() => {});
+              return finalSorted;
             });
             if (newMsg.sender_code === userCode) {
               setPendingQueue(prev => {
@@ -247,13 +300,16 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const marcarComoLidas = async () => {
     await supabase.from('mensagens').update({ read_at: new Date(getSyncedTime()).toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
+    // Limpa a notificação da gaveta do celular assim que a pessoa entra no chat
+    // OneSignal.Notifications.clearAll();
   };
 
-  const handleTextChange = async (text) => {
+  const handleTextChange = (text) => {
+    inputTextRef.current = text; // 🚀 Salva imediatamente na memória absoluta
     setInputText(text);
-    try {
-      await AsyncStorage.setItem(`@draft_${userCode}_${friendCode}`, text);
-    } catch (e) { console.error(e); }
+    
+    // 🚀 Removemos o 'await' para não engasgar o teclado ao digitar rápido
+    AsyncStorage.setItem(`@draft_${userCode}_${friendCode}`, text).catch(() => {});
 
     channelRef.current?.send({
       type: 'broadcast',
@@ -263,10 +319,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleSendMessage = async () => {
-    if (inputText.trim() === '') return;
-    const messageContent = inputText.trim();
+    const currentText = inputTextRef.current; // 🚀 Lê da referência (garante a última palavra)
+    if (currentText.trim() === '') return;
+    
+    const messageContent = currentText.trim();
     const currentReplyId = replyingTo ? replyingTo.id : null;
     
+    inputTextRef.current = '';
     setInputText('');
     setReplyingTo(null);
 
@@ -369,6 +428,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       await supabase.from('mensagens').insert([{ sender_code: userCode, receiver_code: friendCode, content: mediaType === 'video' ? '📹 Vídeo enviado' : '📩 Arquivo de mídia enviado', media_url: mediaUrl, media_type: mediaType, reply_to_id: replyingTo?.id }]);
 
       setMessages((prev) => prev.filter(msg => msg.id !== tempId));
+      
+      sendWeatherNotification(userCode, friendCode);
       setReplyingTo(null);
     } catch (err) { 
       setMessages((prev) => prev.filter(msg => msg.id !== tempId));
@@ -403,7 +464,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleSelectMedia = async (type) => {
-    setMenuVisible(false);
+    setAttachMenuVisible(false);
     try {
       if (setPickerActive) setPickerActive(true); // Ativa ANTES de pedir as permissões!
       
@@ -416,11 +477,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       let result = null;
       if (type === 'camera_photo') {
-        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: false, quality: 1 });
+        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: false });
       } else if (type === 'camera_video') {
         result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Videos, allowsEditing: false });
       } else if (type === 'gallery') {
-        result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 1 });
+        result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false });
       }
 
       if (setPickerActive) setPickerActive(false);
@@ -464,7 +525,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       await supabase.from('mensagens').delete().match({ sender_code: userCode, receiver_code: friendCode });
       await supabase.from('mensagens').delete().match({ sender_code: friendCode, receiver_code: userCode });
       setMessages([]);
-      setMenuVisible(false);
+      AsyncStorage.removeItem(`@cache_msgs_${userCode}_${friendCode}`).catch(() => {});
+      setTopMenuVisible(false);
     } catch (err) { console.error(err); }
   };
 
@@ -490,18 +552,27 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     );
   };
 
+  const handleScroll = (event) => {
+    const yOffset = event.nativeEvent.contentOffset.y;
+    setShowScrollToBottom(yOffset > 250);
+  };
+
   const renderItem = ({ item }) => {
     const isMyMessage = item.sender_code === userCode;
     const timeString = new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
 
-    // 🚀 LÓGICA WHATSAPP: Verifica se a mensagem contém APENAS emojis (até 10 caracteres)
+    // 🚀 LÓGICA WHATSAPP: Verifica se a mensagem contém APENAS emojis (1 a 3 emojis no máximo)
     let isEmojiOnly = false;
     if (!item.media_url && item.content && !quotedMsg) {
       const cleanText = item.content.replace(/[\s\n]/g, '');
-      if (cleanText.length > 0 && cleanText.length <= 10) {
-        isEmojiOnly = /^[\p{Emoji_Presentation}\p{Extended_Pictographic}]+$/u.test(cleanText);
+      if (cleanText.length > 0 && cleanText.length <= 25) {
+        const isAllEmoji = /^[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]+$/u.test(cleanText);
+        const emojiCount = (cleanText.match(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu) || []).length;
+        if (isAllEmoji && emojiCount > 0 && emojiCount <= 3) {
+          isEmojiOnly = true;
+        }
       }
     }
 
@@ -516,7 +587,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       <SwipeableMessage onReply={() => setReplyingTo(item)}>
         <TouchableOpacity
           activeOpacity={0.9}
-          onPressIn={() => {
+          onPressIn={(e) => {
+            touchStartX.current = e.nativeEvent.pageX;
+            touchStartY.current = e.nativeEvent.pageY;
+            isScrolling.current = false;
+
             hasTriggeredShort.current = false;
             hasTriggeredLong.current = false;
 
@@ -533,9 +608,19 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               hasTriggeredLong.current = true;
             }, 1300);
           }}
-          onPressOut={() => {
+          onPressOut={(e) => {
             clearTimeout(shortTimer.current);
             clearTimeout(longTimer.current);
+
+            // Mede a distância percorrida pelo dedo. Se foi > 15px, foi rolagem de tela!
+            const dx = Math.abs(e.nativeEvent.pageX - touchStartX.current);
+            const dy = Math.abs(e.nativeEvent.pageY - touchStartY.current);
+            if (dx > 15 || dy > 15) {
+              isScrolling.current = true;
+            }
+          }}
+          onPress={() => {
+            if (isScrolling.current) return;
 
             if (!hasTriggeredShort.current && !hasTriggeredLong.current) {
               if (item.status === 'failed') {
@@ -619,15 +704,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           <View style={styles.headerInfo}>
             <Text style={styles.friendName} numberOfLines={1}>{currentFriendName}</Text>
             <Text style={[styles.friendStatus, isFriendTyping && { color: '#00ff66', fontWeight: 'bold' }]}>
-              {isFriendTyping ? 'digitando...' : 'Canal seguro ativo'}
+              {isFriendTyping ? 'digitando...' : friendCode}
             </Text>
           </View>
-          <TouchableOpacity onPress={() => setMenuVisible(true)} style={styles.menuBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+          <TouchableOpacity onPress={() => setTopMenuVisible(true)} style={styles.menuBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
             <Ionicons name="ellipsis-vertical" size={20} color="#00ff66" />
           </TouchableOpacity>
         </View>
 
-        <View style={{ flex: 1, backgroundColor: '#050505' }}>
+        <View style={{ flex: 1, backgroundColor: '#050505', position: 'relative' }}>
           {loading ? (
             <ActivityIndicator size="large" color="#00ff66" style={{ flex: 1 }} />
           ) : (
@@ -640,7 +725,17 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               contentContainerStyle={[styles.messagesList, { paddingHorizontal: SCREEN_WIDTH < 360 ? 8 : 12 }]} 
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={false}
+              onScroll={handleScroll}
+              scrollEventThrottle={16}
             />
+          )}
+          {showScrollToBottom && (
+            <TouchableOpacity 
+              style={styles.scrollToBottomBtn} 
+              onPress={() => flatListRef.current?.scrollToOffset({ offset: 0, animated: true })}
+            >
+              <Ionicons name="chevron-down" size={22} color="#64748B" />
+            </TouchableOpacity>
           )}
         </View>
 
@@ -656,7 +751,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
         <View style={styles.inputWrapper}>
           <View style={styles.inputContainer}>
-            <TouchableOpacity onPress={() => setMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <TouchableOpacity onPress={() => setAttachMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="attach-outline" size={22} color="#64748B" />
             </TouchableOpacity>
             <TextInput style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
@@ -665,18 +760,24 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         </View>
       </KeyboardAvoidingView>
 
-      {/* MODAL 1: Menu Geral */}
-      <Modal animationType="fade" transparent visible={menuVisible} onRequestClose={() => setMenuVisible(false)}>
-        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setMenuVisible(false)}>
+      {/* MODAL 1.1: Menu de Anexos (Clipe) */}
+      <Modal animationType="fade" transparent visible={attachMenuVisible} onRequestClose={() => setAttachMenuVisible(false)}>
+        <TouchableOpacity style={styles.attachMenuOverlay} activeOpacity={1} onPress={() => setAttachMenuVisible(false)}>
+          <View style={styles.attachMenuContent}>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={22} color="#00ff66" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Foto)</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={22} color="#ef4444" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Vídeo)</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('gallery')}><Ionicons name="images-outline" size={22} color="#3b82f6" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Galeria</Text></TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* MODAL 1.2: Menu do Topo (Geral) */}
+      <Modal animationType="fade" transparent visible={topMenuVisible} onRequestClose={() => setTopMenuVisible(false)}>
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setTopMenuVisible(false)}>
           <View style={[styles.menuContent, { width: Math.min(SCREEN_WIDTH * 0.85, 320) }]}>
-            <Text style={styles.menuSectionTitle}>Enviar Mídia</Text>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Tirar Foto</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Gravar Vídeo</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => handleSelectMedia('gallery')}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Escolher da Galeria</Text></TouchableOpacity>
-            <View style={styles.menuDivider} />
             <Text style={styles.menuSectionTitle}>Ações do Chat</Text>
-            <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setMediaGalleryVisible(true); }}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Mídias do Chat</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={() => { setMenuVisible(false); setEditNameVisible(true); }}><Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Editar Nome</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => { setTopMenuVisible(false); setMediaGalleryVisible(true); }}><Ionicons name="images-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Mídias do Chat</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={() => { setTopMenuVisible(false); setEditNameVisible(true); }}><Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Editar Nome</Text></TouchableOpacity>
             <TouchableOpacity style={styles.menuItem} onPress={handleClearChat}><Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 10 }} /><Text style={[styles.menuItemText, { color: '#ef4444' }]}>Excluir Bate-papo</Text></TouchableOpacity>
           </View>
         </TouchableOpacity>
@@ -831,7 +932,7 @@ const styles = StyleSheet.create({
   friendStatus: { color: '#64748B', fontSize: 11, marginTop: 2 },
   messagesList: { paddingVertical: 18 },
   swipeContainer: { flexDirection: 'row', alignItems: 'center', width: '100%', position: 'relative' },
-  replyIconLeft: { position: 'absolute', left: -25, justifyContent: 'center', height: '100%' },
+  replyIconLeft: { position: 'absolute', left: -38, justifyContent: 'center', height: '100%' },
   messageBubble: { paddingHorizontal: 13, paddingVertical: 9, borderRadius: 16, marginBottom: 16, position: 'relative', minWidth: 60 },
   myBubble: { backgroundColor: '#1E293B', alignSelf: 'flex-end', borderBottomRightRadius: 4 },
   theirBubble: { backgroundColor: '#0d0d0d', alignSelf: 'flex-start', borderBottomLeftRadius: 4, borderWidth: 1, borderColor: '#111' },
@@ -866,6 +967,9 @@ const styles = StyleSheet.create({
   menuItemText: { color: '#fff', fontSize: 14, fontWeight: '500' },
   menuDivider: { height: 1, backgroundColor: '#1F2937', marginVertical: 8 },
   menuSectionTitle: { color: '#64748B', fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase', marginBottom: 4, marginTop: 8 },
+  attachMenuOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-end', paddingBottom: Platform.OS === 'ios' ? 90 : 80, paddingLeft: 15 },
+  attachMenuContent: { backgroundColor: '#111827', borderRadius: 16, paddingVertical: 8, paddingHorizontal: 15, borderWidth: 1, borderColor: '#1F2937', width: 220, marginBottom: 5 },
+  attachMenuItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 14 },
   modalOverlayDark: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
   editNameCard: { backgroundColor: '#0d0d0d', borderRadius: 20, padding: 22, borderWidth: 1, borderColor: '#1F2937', width: '90%', maxWidth: 380 },
   modalTitle: { color: '#fff', fontSize: 16, fontWeight: 'bold', marginBottom: 15, textAlign: 'center' },
@@ -887,5 +991,23 @@ const styles = StyleSheet.create({
   linkPreviewImage: { width: '100%', height: 120, backgroundColor: '#1e293b' },
   linkPreviewTextContainer: { padding: 10 },
   linkPreviewTitle: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 4 },
-  linkPreviewDesc: { color: '#94A3B8', fontSize: 12 }
+  linkPreviewDesc: { color: '#94A3B8', fontSize: 12 },
+  scrollToBottomBtn: {
+    position: 'absolute',
+    bottom: 12,
+    right: 12,
+    backgroundColor: '#1E293B',
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#334155',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 3
+  }
 });

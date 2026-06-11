@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextI
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+// import { OneSignal } from 'react-native-onesignal';
 import { supabase } from '../supabase';
 
 export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat }) {
@@ -22,6 +23,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const [pinnedTokens, setPinnedTokens] = useState([]);
   const [optionsModalVisible, setOptionsModalVisible] = useState(false);
   const [chatOptionTarget, setChatOptionTarget] = useState(null);
+  const [notifEnabled, setNotifEnabled] = useState(false);
 
   const devClicksRef = useRef(0);
   const devTimeoutRef = useRef(null);
@@ -89,9 +91,42 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     } catch (e) { console.error(e); }
   };
 
+  useEffect(() => {
+    const loadNotifState = async () => {
+      const state = await AsyncStorage.getItem('@notifications_enabled');
+      setNotifEnabled(state === 'true');
+    };
+    loadNotifState();
+  }, []);
+
+  const handleToggleNotifications = async () => {
+    const newState = !notifEnabled;
+    setNotifEnabled(newState);
+    await AsyncStorage.setItem('@notifications_enabled', newState ? 'true' : 'false');
+    if (newState) {
+      // OneSignal.User.pushSubscription.optIn();
+      try {
+        const osId = null; // await OneSignal.User.pushSubscription.getIdAsync();
+        if (osId && userCode) {
+          await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', userCode.trim().toLowerCase());
+        }
+      } catch (e) {}
+      alert('Notificações de Clima ATIVADAS.');
+    } else {
+      // OneSignal.User.pushSubscription.optOut();
+      alert('Notificações de Clima DESATIVADAS.');
+    }
+  };
+
   const fetchMyConversations = async () => {
     if (!userCode) return;
     const myCleanCode = userCode.trim().toLowerCase();
+
+    // 🚀 CACHE: Carrega histórico salvo na memória para acesso instantâneo/offline
+    try {
+      const cached = await AsyncStorage.getItem(`@cache_chats_${myCleanCode}`);
+      if (cached) setChats(JSON.parse(cached));
+    } catch (e) {}
 
     try {
       const { data: myConnections } = await supabase.from('conexoes').select('*').eq('user_code', myCleanCode);
@@ -158,13 +193,28 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         }
       });
 
-      setChats(Array.from(conversationMap.values()));
+      const finalChats = Array.from(conversationMap.values());
+      setChats(finalChats);
+      
+      // Atualiza o cache silenciosamente
+      AsyncStorage.setItem(`@cache_chats_${myCleanCode}`, JSON.stringify(finalChats)).catch(() => {});
     } catch (err) { console.error(err); } finally { setLoading(false); }
   };
 
   useEffect(() => {
     loadPinnedChats();
     fetchMyConversations();
+
+    // 🚀 GARANTIA: Sincroniza o OneSignal ID mais recente com o servidor
+    const syncOsId = async () => {
+      try {
+        const osId = null; // await OneSignal.User.pushSubscription.getIdAsync();
+        if (osId && userCode) {
+          await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', userCode.trim().toLowerCase());
+        }
+      } catch (e) {}
+    };
+    syncOsId();
 
     const cleanUserCode = userCode.trim().toLowerCase();
     
@@ -310,7 +360,12 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
             </View>
           </View>
         </View>
-        <TouchableOpacity style={styles.backBtn} onPress={onBack}><Text style={styles.backBtnText}>Fechar Chat</Text></TouchableOpacity>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <TouchableOpacity style={styles.notifBtn} onPress={handleToggleNotifications}>
+            <Ionicons name={notifEnabled ? "notifications" : "notifications-off"} size={20} color={notifEnabled ? "#00ff66" : "#64748B"} />
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.backBtn} onPress={onBack}><Text style={styles.backBtnText}>Fechar Chat</Text></TouchableOpacity>
+        </View>
       </View>
 
       <Text style={styles.sectionTitle}>Canais Ativos</Text>
@@ -413,6 +468,7 @@ const styles = StyleSheet.create({
   profileInfo: { marginLeft: 12 },
   myNickname: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   myCode: { color: '#64748B', fontSize: 12, fontFamily: 'monospace', marginTop: 2 },
+  notifBtn: { backgroundColor: '#111', padding: 8, borderRadius: 16, borderWidth: 1, borderColor: '#222' },
   backBtn: { backgroundColor: '#111', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 16, borderWidth: 1, borderColor: '#222' },
   backBtnText: { color: '#ef4444', fontSize: 13, fontWeight: 'bold' },
   sectionTitle: { color: '#23354D', fontSize: 12, textTransform: 'uppercase', fontWeight: 'bold', marginLeft: 20, marginTop: 25, marginBottom: 10 },
