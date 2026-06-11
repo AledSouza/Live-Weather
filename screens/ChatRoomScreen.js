@@ -2,18 +2,40 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity,
   SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform, Linking,
-  StatusBar, Modal, Image, Animated, PanResponder, useWindowDimensions
+  StatusBar, Modal, Image, Animated, PanResponder, useWindowDimensions, ScrollView
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { Video, ResizeMode } from 'expo-av';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Clipboard from 'expo-clipboard';
 import { supabase } from '../supabase';
 
 const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ6bWh2aW5tYXZ3Z3RnbHJocW1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEwNTA0NTcsImV4cCI6MjA5NjYyNjQ1N30.Yp6w81vNORd7sKguYV7x6kl476KJoMbl5es1GdwjpLc';
+
+// 🚀 Sincronizador Global de Tempo (Proteção contra hora errada no celular)
+let globalTimeOffset = 0;
+let isTimeSynced = false;
+
+const syncTimeWithServer = async () => {
+  if (isTimeSynced) return;
+  try {
+    const start = Date.now();
+    // Pede apenas o cabeçalho do servidor para não consumir banda de download
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/`, { method: 'HEAD' });
+    const dateHeader = res.headers.get('date');
+    if (dateHeader) {
+      const serverTime = new Date(dateHeader).getTime();
+      const latency = (Date.now() - start) / 2; // Desconta o atraso da internet
+      globalTimeOffset = serverTime - Date.now() + latency;
+      isTimeSynced = true;
+    }
+  } catch (e) { console.warn('Falha na sincronização de tempo', e); }
+};
+const getSyncedTime = () => Date.now() + globalTimeOffset;
 
 const SwipeableMessage = ({ children, onReply }) => {
   const pan = useRef(new Animated.Value(0)).current;
@@ -77,6 +99,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const IMAGE_SIZE = Math.min(SCREEN_WIDTH * 0.65, 320);
 
   useEffect(() => {
+    syncTimeWithServer(); // Inicia a sincronização assim que abre a tela
     const initializeChatState = async () => {
       try {
         const savedDraft = await AsyncStorage.getItem(`@draft_${userCode}_${friendCode}`);
@@ -223,7 +246,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   }, [userCode, friendCode]);
 
   const marcarComoLidas = async () => {
-    await supabase.from('mensagens').update({ read_at: new Date().toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
+    await supabase.from('mensagens').update({ read_at: new Date(getSyncedTime()).toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
   };
 
   const handleTextChange = async (text) => {
@@ -253,7 +276,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
     channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { sender: userCode, isTyping: false } });
 
-    let newTime = Date.now();
+    let newTime = getSyncedTime();
     if (newTime <= lastMessageTimeRef.current) {
       newTime = lastMessageTimeRef.current + 1;
     }
@@ -286,7 +309,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const getMessageLifetime = (createdAt) => {
     const creationDate = new Date(createdAt);
     const expirationDate = new Date(creationDate.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const now = new Date();
+    const now = new Date(getSyncedTime()); // Usa a hora sincronizada no timer de destruição
     const diffMs = expirationDate - now;
 
     if (diffMs <= 0) return { exato: creationDate.toLocaleString('pt-BR'), restante: "Expirando..." };
@@ -322,13 +345,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleUploadAndSendMedia = async (uri, mediaType) => {
+    const tempTime = getSyncedTime();
+    const tempId = `temp-${tempTime}`;
     try {
       setUploading(true);
-      const tempId = `temp-${Date.now()}`;
-      setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date().toISOString(), is_uploading: true }, ...prev]);
+      setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date(tempTime).toISOString(), is_uploading: true }, ...prev]);
 
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
-      const filename = `${userCode}-${Date.now()}.${ext}`;
+      const filename = `${userCode}-${tempTime}.${ext}`;
       const mimeType = mediaType === 'video' ? 'video/mp4' : 'image/jpeg';
 
       const formData = new FormData();
@@ -346,43 +370,58 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       setMessages((prev) => prev.filter(msg => msg.id !== tempId));
       setReplyingTo(null);
-    } catch (err) { alert(`Falha: ${err.message}`); } finally { setUploading(false); }
+    } catch (err) { 
+      setMessages((prev) => prev.filter(msg => msg.id !== tempId));
+      alert(`Falha no envio. O servidor de mídias pode estar cheio. Considere fazer uma limpeza de armazenamento.\n\nErro: ${err.message}`); 
+    } finally { setUploading(false); }
   };
 
   const handleDownloadMedia = async (url) => {
     try {
+      if (setPickerActive) setPickerActive(true); // Previne o lock da tela ao abrir o modal de permissão nativo
       const { status } = await MediaLibrary.requestPermissionsAsync(true);
-      if (status !== 'granted') return alert('Permissão necessária para salvar na galeria.');
+      if (status !== 'granted') {
+        if (setPickerActive) setPickerActive(false);
+        return alert('Permissão necessária para salvar na galeria.');
+      }
       
-      const filename = url.split('/').pop();
+      // Remove query params e garante que exista uma extensão de arquivo válida
+      const rawFilename = url.split('/').pop().split('?')[0];
+      const filename = rawFilename.includes('.') ? rawFilename : `${rawFilename}.jpg`;
       const fileUri = `${FileSystem.documentDirectory}${filename}`;
       
       const downloadRes = await FileSystem.downloadAsync(url, fileUri);
       await MediaLibrary.saveToLibraryAsync(downloadRes.uri);
+      
+      if (setPickerActive) setPickerActive(false);
       alert('Mídia salva na galeria com sucesso!');
     } catch (err) {
+      if (setPickerActive) setPickerActive(false);
       console.error(err);
-      alert('Erro ao salvar o arquivo.');
+      alert('Erro ao salvar o arquivo: ' + err.message);
     }
   };
 
   const handleSelectMedia = async (type) => {
     setMenuVisible(false);
     try {
+      if (setPickerActive) setPickerActive(true); // Ativa ANTES de pedir as permissões!
+      
       const resPhoto = await ImagePicker.requestMediaLibraryPermissionsAsync();
       const resCam = await ImagePicker.requestCameraPermissionsAsync();
-      if (!resPhoto.granted || !resCam.granted) return alert('Permissões necessárias.');
-
-      if (setPickerActive) setPickerActive(true);
+      if (!resPhoto.granted || !resCam.granted) {
+        if (setPickerActive) setPickerActive(false);
+        return alert('Permissões necessárias.');
+      }
 
       let result = null;
-        if (type === 'camera_photo') {
-          result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: true, quality: 0.5 });
-        } else if (type === 'camera_video') {
-          result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Videos, allowsEditing: true, quality: 0.5 });
-        } else if (type === 'gallery') {
-          result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 0.5 });
-        }
+      if (type === 'camera_photo') {
+        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: false, quality: 1 });
+      } else if (type === 'camera_video') {
+        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Videos, allowsEditing: false });
+      } else if (type === 'gallery') {
+        result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false, quality: 1 });
+      }
 
       if (setPickerActive) setPickerActive(false);
 
@@ -422,20 +461,21 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       }
       
       // Deleta definitivamente as mensagens do banco de dados (para os dois usuários)
-      await supabase.from('mensagens').delete().or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`);
+      await supabase.from('mensagens').delete().match({ sender_code: userCode, receiver_code: friendCode });
+      await supabase.from('mensagens').delete().match({ sender_code: friendCode, receiver_code: userCode });
       setMessages([]);
       setMenuVisible(false);
     } catch (err) { console.error(err); }
   };
 
   // Função que converte as URLs dentro do texto em Links azuis clicáveis
-  const renderMessageText = (text, isFailed) => {
+  const renderMessageText = (text, isFailed, isEmojiOnly) => {
     if (!text) return null;
     const urlRegex = /(https?:\/\/[^\s]+)/g;
     const parts = text.split(urlRegex);
     
     return (
-      <Text style={[styles.messageText, isFailed && { color: '#94a3b8' }]}>
+      <Text style={[styles.messageText, isFailed && { color: '#94a3b8' }, isEmojiOnly && { fontSize: 50, lineHeight: 60, textAlign: 'center' }]}>
         {parts.map((part, index) => {
           if (part.match(urlRegex)) {
             return (
@@ -455,6 +495,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const timeString = new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
+
+    // 🚀 LÓGICA WHATSAPP: Verifica se a mensagem contém APENAS emojis (até 10 caracteres)
+    let isEmojiOnly = false;
+    if (!item.media_url && item.content && !quotedMsg) {
+      const cleanText = item.content.replace(/[\s\n]/g, '');
+      if (cleanText.length > 0 && cleanText.length <= 10) {
+        isEmojiOnly = /^[\p{Emoji_Presentation}\p{Extended_Pictographic}]+$/u.test(cleanText);
+      }
+    }
 
     let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicks ? '#00bfff' : '#475569'} style={{ marginLeft: 4 }} />;
     if (item.status === 'sending') {
@@ -502,7 +551,12 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               }
             }
           }}
-          style={[styles.messageBubble, isMyMessage ? styles.myBubble : styles.theirBubble, { maxWidth: SCREEN_WIDTH * 0.78 }]}
+      style={[
+        styles.messageBubble, 
+        isMyMessage ? styles.myBubble : styles.theirBubble, 
+        { maxWidth: SCREEN_WIDTH * 0.78 },
+        isEmojiOnly && { backgroundColor: 'transparent', borderWidth: 0, elevation: 0, paddingBottom: 4 }
+      ]}
         >
           {quotedMsg && (
             <View style={styles.quoteInsideBubble}>
@@ -531,9 +585,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             </View>
           ) : (
             <>
-              {renderMessageText(item.content, item.status === 'failed')}
-              <View style={styles.bubbleFooter}>
-                <Text style={styles.messageTime}>{timeString}</Text>
+          {renderMessageText(item.content, item.status === 'failed', isEmojiOnly)}
+          <View style={[styles.bubbleFooter, isEmojiOnly && { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 }]}>
+            <Text style={[styles.messageTime, isEmojiOnly && { color: '#fff' }]}>{timeString}</Text>
                 {isMyMessage && statusIcon}
               </View>
             </>
@@ -654,9 +708,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               </View>
             )}
             {infoModalMessage?.content && !infoModalMessage?.media_url && (
-              <View style={styles.selectableTextContainer}>
-                <Text selectable={true} style={styles.selectableText}>{infoModalMessage.content}</Text>
-                <Text style={{ color: '#64748B', fontSize: 10, marginTop: 5, textAlign: 'center' }}>Segure no texto acima para selecionar trechos</Text>
+              <View style={[styles.selectableTextContainer, { maxHeight: 250 }]}>
+                <ScrollView nestedScrollEnabled indicatorStyle="white">
+                  <Text selectable={true} style={styles.selectableText}>{infoModalMessage.content}</Text>
+                </ScrollView>
+                <Text style={{ color: '#64748B', fontSize: 10, marginTop: 10, textAlign: 'center' }}>Segure no texto acima para selecionar trechos</Text>
               </View>
             )}
             <View style={styles.modalButtons}>
@@ -669,20 +725,41 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       {/* MODAL 4: Menu de Reações Flutuantes (Short Hold) */}
       <Modal animationType="fade" transparent visible={!!reactionTargetMessage} onRequestClose={() => { setReactionTargetMessage(null); setShowCustomEmojiInput(false); }}>
-        <TouchableOpacity style={styles.reactionOverlay} activeOpacity={1} onPress={() => { setReactionTargetMessage(null); setShowCustomEmojiInput(false); }}>
-          <View style={[styles.reactionRowBar, { maxWidth: SCREEN_WIDTH * 0.9 }]}>
-            {showCustomEmojiInput ? (
-              <TextInput autoFocus style={{ color: '#fff', fontSize: 26, minWidth: 50, textAlign: 'center' }} placeholder="+" placeholderTextColor="#64748B" onChangeText={(text) => { if (text.trim().length > 0) { handleReactToMessage(reactionTargetMessage.id, text.trim()); setShowCustomEmojiInput(false); } }} />
-            ) : (
-              <>
-                {['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => (
-                  <TouchableOpacity key={emoji} style={styles.reactionEmojiBtn} onPress={() => handleReactToMessage(reactionTargetMessage.id, emoji)}><Text style={{ fontSize: 26 }}>{emoji}</Text></TouchableOpacity>
-                ))}
-                <TouchableOpacity style={styles.reactionEmojiBtn} onPress={() => setShowCustomEmojiInput(true)}><Ionicons name="add-circle" size={32} color="#64748B" style={{ marginTop: 2 }} /></TouchableOpacity>
-              </>
-            )}
+        <View style={styles.reactionOverlay}>
+          {/* 🚀 Barra Superior Contextual (Estilo WhatsApp) */}
+          <View style={styles.contextualHeaderContainer}>
+            <TouchableOpacity onPress={() => { setReactionTargetMessage(null); setShowCustomEmojiInput(false); }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Ionicons name="arrow-back" size={24} color="#fff" />
+            </TouchableOpacity>
+            
+            <View style={styles.contextualActions}>
+              {reactionTargetMessage && !reactionTargetMessage.media_url && (
+                <TouchableOpacity onPress={async () => {
+                  await Clipboard.setStringAsync(reactionTargetMessage.content || '');
+                  setReactionTargetMessage(null);
+                }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                  <Ionicons name="copy-outline" size={24} color="#fff" />
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
-        </TouchableOpacity>
+
+          {/* Fundo clicável para fechar + Menu de Emojis */}
+          <TouchableOpacity style={styles.reactionOverlayDismiss} activeOpacity={1} onPress={() => { setReactionTargetMessage(null); setShowCustomEmojiInput(false); }}>
+            <View style={[styles.reactionRowBar, { maxWidth: SCREEN_WIDTH * 0.9 }]}>
+              {showCustomEmojiInput ? (
+                <TextInput autoFocus style={{ color: '#fff', fontSize: 26, minWidth: 50, textAlign: 'center' }} placeholder="+" placeholderTextColor="#64748B" onChangeText={(text) => { if (text.trim().length > 0) { handleReactToMessage(reactionTargetMessage.id, text.trim()); setShowCustomEmojiInput(false); } }} />
+              ) : (
+                <>
+                  {['👍', '❤️', '😂', '😮', '😢', '🙏'].map((emoji) => (
+                    <TouchableOpacity key={emoji} style={styles.reactionEmojiBtn} onPress={() => handleReactToMessage(reactionTargetMessage.id, emoji)}><Text style={{ fontSize: 26 }}>{emoji}</Text></TouchableOpacity>
+                  ))}
+                  <TouchableOpacity style={styles.reactionEmojiBtn} onPress={() => setShowCustomEmojiInput(true)}><Ionicons name="add-circle" size={32} color="#64748B" style={{ marginTop: 2 }} /></TouchableOpacity>
+                </>
+              )}
+            </View>
+          </TouchableOpacity>
+        </View>
       </Modal>
 
       {/* MODAL 5: Imagem em Tela Cheia */}
@@ -768,7 +845,10 @@ const styles = StyleSheet.create({
   myBadgePos: { right: 10 },
   theirBadgePos: { left: 10 },
   reactionText: { color: '#fff', fontSize: 11 },
-  reactionOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center' },
+  reactionOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)' },
+  contextualHeaderContainer: { backgroundColor: '#1E293B', width: '100%', paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 0) + 15 : 55, paddingBottom: 15, paddingHorizontal: 20, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 3.84 },
+  contextualActions: { flexDirection: 'row', alignItems: 'center' },
+  reactionOverlayDismiss: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   reactionRowBar: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', backgroundColor: '#0d0d0d', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 30, borderWidth: 1, borderColor: '#1F2937', gap: 14, elevation: 10 },
   reactionEmojiBtn: { padding: 4 },
   replyBarContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#0d0d0d', paddingHorizontal: 16, paddingVertical: 10, borderTopWidth: 1, borderTopColor: '#1F2937' },

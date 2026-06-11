@@ -33,7 +33,8 @@
           "photosPermission": "O aplicativo precisa acessar suas fotos para salvar mídias.",
           "savePhotosPermission": "O aplicativo precisa de permissão para salvar fotos na galeria."
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "eas": {

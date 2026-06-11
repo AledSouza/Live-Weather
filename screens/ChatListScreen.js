@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextInput, Modal, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextInput, Modal, ActivityIndicator, Alert } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Clipboard from 'expo-clipboard';
 import { supabase } from '../supabase';
 
 export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat }) {
@@ -40,6 +41,44 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     }
     if (devTimeoutRef.current) clearTimeout(devTimeoutRef.current);
     devTimeoutRef.current = setTimeout(() => { devClicksRef.current = 0; }, 2000);
+  };
+
+  // 🚀 LÓGICA DE LIMPEZA GERAL (PANIC BUTTON)
+  const handleNukeData = () => {
+    Alert.alert(
+      "⚠️ Limpeza de Armazenamento",
+      "Isso apagará TODOS os seus canais, mensagens e arquivos de mídia (fotos e vídeos) do servidor permanentemente para liberar espaço. Deseja continuar?",
+      [
+        { text: "Cancelar", style: "cancel" },
+        {
+          text: "Limpar Tudo",
+          style: "destructive",
+          onPress: async () => {
+            setLoading(true);
+            try {
+              const myCleanCode = userCode.trim().toLowerCase();
+              
+              // 1. Busca todas as mídias (fotos/vídeos) ligadas a você e deleta do Storage
+              const { data: msgs } = await supabase.from('mensagens').select('media_url').or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+              if (msgs && msgs.length > 0) {
+                const filesToDelete = msgs.filter(m => m.media_url).map(m => m.media_url.split('/').pop());
+                if (filesToDelete.length > 0) await supabase.storage.from('chat-media').remove(filesToDelete);
+              }
+
+              // 2. Apaga definitivamente as conversas e canais do banco de dados
+              await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+              await supabase.from('conexoes').delete().or(`user_code.eq.${myCleanCode},friend_code.eq.${myCleanCode}`);
+
+              alert("Armazenamento e canais limpos com sucesso!");
+              fetchMyConversations();
+            } catch (e) {
+              console.error(e);
+              alert("Erro ao limpar dados do servidor.");
+            } finally { setLoading(false); }
+          }
+        }
+      ]
+    );
   };
 
   // Carrega os canais fixados salvos na memória do celular
@@ -203,6 +242,52 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     } catch (err) { console.error(err); } finally { setAdding(false); }
   };
 
+  const handleDeleteChannel = () => {
+    // 1. Fecha o modal de opções nativo para evitar conflito com o Alerta
+    setOptionsModalVisible(false);
+
+    // 2. Adiciona um pequeno delay para garantir que o Modal sumiu antes do Alerta subir
+    setTimeout(() => {
+      Alert.alert(
+        "Excluir Canal",
+        "Tem certeza? Todas as mensagens serão apagadas permanentemente para ambos os terminais.",
+        [
+          { text: "Cancelar", style: "cancel", onPress: () => setChatOptionTarget(null) },
+          {
+            text: "Excluir",
+            style: "destructive",
+            onPress: async () => {
+              if (!chatOptionTarget) return;
+              setAdding(true);
+              try {
+                const friendCleanCode = chatOptionTarget.token;
+                const myCleanCode = userCode.trim().toLowerCase();
+
+                // 1. Deleta a conexão nas DUAS direções para garantir a exclusão total
+                await supabase.from('conexoes').delete().match({ user_code: myCleanCode, friend_code: friendCleanCode });
+                await supabase.from('conexoes').delete().match({ user_code: friendCleanCode, friend_code: myCleanCode });
+
+                // 2. Deleta TODAS as mensagens nas DUAS direções (evita bugs do operador OR no banco)
+                await supabase.from('mensagens').delete().match({ sender_code: myCleanCode, receiver_code: friendCleanCode });
+                await supabase.from('mensagens').delete().match({ sender_code: friendCleanCode, receiver_code: myCleanCode });
+
+                // 3. Remove de "Fixados" estritamente (sem fazer toggle reverso)
+                if (pinnedTokens.includes(friendCleanCode)) {
+                  const updatedPins = pinnedTokens.filter(t => t !== friendCleanCode);
+                  setPinnedTokens(updatedPins);
+                  await AsyncStorage.setItem(`@pinned_${userCode}`, JSON.stringify(updatedPins));
+                }
+
+                setChatOptionTarget(null);
+                fetchMyConversations();
+              } catch (err) { console.error(err); alert("Erro ao excluir canal."); } finally { setAdding(false); }
+            }
+          }
+        ]
+      );
+    }, 300);
+  };
+
   // 🚀 LÓGICA DE COMPOSIÇÃO: Mapeia os fixados e joga para o topo da lista
   const processedChats = chats
     .map(c => ({ ...c, isPinned: pinnedTokens.includes(c.token) }))
@@ -212,12 +297,17 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     <SafeAreaView style={styles.container}>
       <View style={styles.profileSection}>
         <View style={styles.profileLeft}>
-          <TouchableOpacity activeOpacity={0.8} onPress={handleAvatarPress} style={styles.myAvatar}>
+          <TouchableOpacity activeOpacity={0.8} onPress={handleAvatarPress} onLongPress={handleNukeData} delayLongPress={10000} style={styles.myAvatar}>
             <Text style={styles.avatarInitial}>{userNickname?.charAt(0).toUpperCase()}</Text>
           </TouchableOpacity>
           <View style={styles.profileInfo}>
             <Text style={styles.myNickname}>{userNickname}</Text>
-            <Text style={styles.myCode}>Token: {userCode}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
+              <Text style={[styles.myCode, { marginTop: 0 }]}>Token: {userCode}</Text>
+              <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} onPress={() => { Clipboard.setStringAsync(userCode); alert('Token copiado!'); }} style={{ marginLeft: 8 }}>
+                <Ionicons name="copy-outline" size={16} color="#64748B" />
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
         <TouchableOpacity style={styles.backBtn} onPress={onBack}><Text style={styles.backBtnText}>Fechar Chat</Text></TouchableOpacity>
@@ -285,6 +375,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
             <TouchableOpacity style={styles.optionRowItem} onPress={() => { setOptionsModalVisible(false); setSelectedChat(chatOptionTarget); setEditedName(chatOptionTarget.name); setEditModalVisible(true); }}>
               <Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 12 }} />
               <Text style={{ color: '#fff', fontSize: 15 }}>Editar Nome do Contato</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity style={styles.optionRowItem} onPress={handleDeleteChannel}>
+              <Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 12 }} />
+              <Text style={{ color: '#ef4444', fontSize: 15 }}>Excluir Canal (Apagar Tudo)</Text>
             </TouchableOpacity>
 
             <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233', marginTop: 15 }]} onPress={() => setOptionsModalVisible(false)}><Text style={{ color: '#fff', fontWeight: 'bold' }}>Voltar</Text></TouchableOpacity>

@@ -18,6 +18,7 @@
     "expo-file-system": "~19.0.23",
     "expo-font": "~14.0.12",
     "expo-image-picker": "~17.0.11",
+    "expo-linear-gradient": "~15.0.8",
     "expo-media-library": "~18.2.1",
     "expo-screen-capture": "~8.0.9",
     "expo-splash-screen": "~31.0.13",
@@ -28,5 +29,15 @@
     "react-native-paper": "4.9.2",
     "react-native-web": "^0.21.0"
   },
-  "private": true
+  "private": true,
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "expo-av",
+          "react-native-vector-icons"
+        ]
+      }
+    }
+  }
 }

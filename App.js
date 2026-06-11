@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 // 🚀 CORREÇÃO: Adicionados Text e TouchableOpacity que estavam faltando aqui
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as ScreenCapture from 'expo-screen-capture';
 import { supabase } from './supabase';
 
 // Telas do ecossistema
@@ -32,6 +33,16 @@ export default function App() {
   };
 
   useEffect(() => {
+
+    // Previne capturas de tela e oculta o conteúdo do app no multitarefas (Recentes)
+    const secureScreen = async () => {
+      try {
+        await ScreenCapture.preventScreenCaptureAsync();
+      } catch (e) {
+        console.warn('Erro ao proteger a tela:', e);
+      }
+    };
+    secureScreen();
 
     const subscription = AppState.addEventListener('change', nextAppState => {
       if (nextAppState === 'background' || nextAppState === 'inactive') {
