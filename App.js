@@ -4,6 +4,7 @@ import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Tex
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ScreenCapture from 'expo-screen-capture';
 import { supabase } from './supabase';
+import { Ionicons } from '@expo/vector-icons';
 // import { registerForPushNotificationsAsync } from './screens/notificationService';
 
 // Telas do ecossistema
@@ -25,6 +26,13 @@ export default function App() {
   const [activeFriendCode, setActiveFriendCode] = useState(null);
   const [activeFriendName, setActiveFriendName] = useState(null);
 
+  // 🚀 ESTADOS DO SISTEMA PIN DE SEGURANÇA
+  const [showPinPad, setShowPinPad] = useState(false);
+  const [pinMode, setPinMode] = useState('verify'); // 'verify', 'setup', 'redefine'
+  const [pinValue, setPinValue] = useState('');
+  const [savedPin, setSavedPin] = useState(null);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+
   // Função que renova o tempo sempre que a tela é tocada
   const resetInactivityTimer = () => {
     if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
@@ -45,12 +53,24 @@ export default function App() {
     };
     secureScreen();
 
-    const subscription = AppState.addEventListener('change', nextAppState => {
-      if (nextAppState === 'background' || nextAppState === 'inactive') {
-        if (!isPickerActiveRef.current) {
-          setIsChatMode(false);
+    const subscription = AppState.addEventListener('change', async nextAppState => {
+      try {
+        const savedCode = await AsyncStorage.getItem('@connection_code');
+        if (nextAppState === 'background' || nextAppState === 'inactive') {
+          if (!isPickerActiveRef.current) {
+            setIsChatMode(false);
+          }
+          // 🚀 Salva o "Visto por último" ao minimizar/fechar o app
+          if (savedCode) {
+            await supabase.from('perfis').update({ last_seen: new Date().toISOString() }).eq('connection_code', savedCode.trim().toLowerCase());
+          }
+        } else if (nextAppState === 'active') {
+          // 🚀 Atualiza o "Visto por último" ao reabrir o app
+          if (savedCode) {
+            await supabase.from('perfis').update({ last_seen: new Date().toISOString() }).eq('connection_code', savedCode.trim().toLowerCase());
+          }
         }
-      }
+      } catch (e) { console.warn('Erro ao atualizar last_seen', e); }
     });
 
     const checkIdentity = async () => {
@@ -90,8 +110,114 @@ export default function App() {
     };
   }, []);
 
-  const handleUnlockTrigger = () => {
-    setIsChatMode(true);
+  // 🚀 LÓGICA DE ATIVAÇÃO DO PÂNICO GERAL
+  const executePanicProtocol = async () => {
+    try {
+      if (!connectionCode) return;
+      const myCleanCode = connectionCode.trim().toLowerCase();
+      
+      // 1. Descobre todos os contatos com quem você já interagiu
+      const { data: msgs } = await supabase.from('mensagens')
+        .select('sender_code, receiver_code, media_url')
+        .or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+        
+      const uniqueContacts = new Set();
+      const filesToDelete = [];
+      if (msgs) {
+        msgs.forEach(m => {
+          if (m.sender_code !== myCleanCode) uniqueContacts.add(m.sender_code);
+          if (m.receiver_code !== myCleanCode) uniqueContacts.add(m.receiver_code);
+          if (m.media_url) filesToDelete.push(m.media_url.split('/').pop());
+        });
+      }
+      if (filesToDelete.length > 0) {
+        await supabase.storage.from('chat-media').remove(filesToDelete);
+      }
+
+      const { data: myConns } = await supabase.from('conexoes').select('friend_code').eq('user_code', myCleanCode);
+      if (myConns) myConns.forEach(c => uniqueContacts.add(c.friend_code));
+
+      // 2. Apaga definitivamente todas as mensagens (limpa o chat)
+      await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+
+      // 3. Renomeia todos os canais (mantendo-os na lista)
+      await supabase.from('conexoes').update({ friend_name: '####' }).eq('user_code', myCleanCode);
+      await supabase.from('conexoes').update({ friend_name: '####' }).eq('friend_code', myCleanCode);
+
+      // Garante que contatos não-salvos também fiquem ofuscados
+      const existingConns = myConns ? myConns.map(c => c.friend_code) : [];
+      const missingConns = Array.from(uniqueContacts).filter(c => !existingConns.includes(c));
+      if (missingConns.length > 0) {
+        await supabase.from('conexoes').insert(
+          missingConns.map(c => ({ user_code: myCleanCode, friend_code: c, friend_name: '####' }))
+        );
+      }
+
+      // 4. Envia a mensagem técnica para cada contato da lista
+      if (uniqueContacts.size > 0) {
+        const coverUpMessages = Array.from(uniqueContacts).map(contact => ({
+          sender_code: myCleanCode,
+          receiver_code: contact,
+          content: 'Parâmetros revisados e aplicados.',
+        }));
+        await supabase.from('mensagens').insert(coverUpMessages);
+      }
+
+      // Limpa os caches locais da memória do dispositivo
+      const keys = await AsyncStorage.getAllKeys();
+      const cacheKeys = keys.filter(k => k.startsWith('@cache_msgs_') || k.startsWith('@queue_') || k.startsWith('@cache_chats_'));
+      if (cacheKeys.length > 0) await AsyncStorage.multiRemove(cacheKeys);
+
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setFailedAttempts(0);
+      setPinValue('');
+      setShowPinPad(false);
+      setIsChatMode(false);
+    }
+  };
+
+  const handlePinKeyPress = (num) => {
+    if (pinValue.length < 3) {
+      const newVal = pinValue + num;
+      setPinValue(newVal);
+      if (newVal.length === 3) {
+        setTimeout(() => processPinComplete(newVal), 100);
+      }
+    }
+  };
+
+  const processPinComplete = async (val) => {
+    if (pinMode === 'setup' || pinMode === 'redefine') {
+      await AsyncStorage.setItem('@saved_pin', val);
+      setSavedPin(val);
+      alert(pinMode === 'setup' ? 'PIN configurado com sucesso!' : 'PIN redefinido com sucesso!');
+      setShowPinPad(false);
+      setPinValue('');
+      if (pinMode === 'setup') setIsChatMode(true);
+    } else {
+      if (val === savedPin) {
+        setFailedAttempts(0);
+        setPinValue('');
+        setShowPinPad(false);
+        setIsChatMode(true);
+      } else {
+        const errors = failedAttempts + 1;
+        if (errors >= 3) executePanicProtocol();
+        else { setFailedAttempts(errors); setPinValue(''); }
+      }
+    }
+  };
+
+  const handleUnlockTrigger = async () => {
+    const isPinOn = await AsyncStorage.getItem('@pin_enabled');
+    if (isPinOn === 'true') {
+      const currentPin = await AsyncStorage.getItem('@saved_pin');
+      setSavedPin(currentPin);
+      setPinMode(currentPin ? 'verify' : 'setup');
+      setPinValue(''); setFailedAttempts(0); setShowPinPad(true);
+    } else setIsChatMode(true);
   };
 
   const handleSaveIdentity = async () => {
@@ -205,6 +331,46 @@ export default function App() {
     <View style={styles.globalRoot} onTouchStart={resetInactivityTimer}>
       <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" translucent />
       {renderScreen()}
+
+      {/* 🚀 PAINEL DO PIN DE SEGURANÇA */}
+      {showPinPad && (
+        <View style={styles.pinOverlay}>
+          <View style={styles.pinCard}>
+            <Text style={styles.pinTitle}>
+              {pinMode === 'setup' ? 'Crie um PIN (3 dígitos)' :
+               pinMode === 'redefine' ? 'Novo PIN (3 dígitos)' : 'Digite seu PIN'}
+            </Text>
+            {pinMode === 'redefine' && <Text style={styles.redefineText}>redefina seu pin</Text>}
+
+            <View style={styles.pinDots}>
+              {[0, 1, 2].map(i => (
+                <View key={i} style={[styles.pinDot, pinValue.length > i && styles.pinDotFilled]} />
+              ))}
+            </View>
+
+            <View style={styles.pinPadRow}>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('1')} onLongPress={() => { if (pinMode === 'verify') { setPinMode('redefine'); setPinValue(''); } }} delayLongPress={20000}><Text style={styles.pinKeyText}>1</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('2')}><Text style={styles.pinKeyText}>2</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('3')}><Text style={styles.pinKeyText}>3</Text></TouchableOpacity>
+            </View>
+            <View style={styles.pinPadRow}>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('4')}><Text style={styles.pinKeyText}>4</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('5')}><Text style={styles.pinKeyText}>5</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('6')}><Text style={styles.pinKeyText}>6</Text></TouchableOpacity>
+            </View>
+            <View style={styles.pinPadRow}>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('7')}><Text style={styles.pinKeyText}>7</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('8')}><Text style={styles.pinKeyText}>8</Text></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('9')}><Text style={styles.pinKeyText}>9</Text></TouchableOpacity>
+            </View>
+            <View style={styles.pinPadRow}>
+              <TouchableOpacity style={[styles.pinKey, { backgroundColor: 'transparent', borderWidth: 0 }]} onPress={() => { setShowPinPad(false); setPinValue(''); setFailedAttempts(0); }}><Ionicons name="close" size={32} color="#ef4444" /></TouchableOpacity>
+              <TouchableOpacity style={styles.pinKey} onPress={() => handlePinKeyPress('0')}><Text style={styles.pinKeyText}>0</Text></TouchableOpacity>
+              <TouchableOpacity style={[styles.pinKey, { backgroundColor: 'transparent', borderWidth: 0 }]} onPress={() => setPinValue(pinValue.slice(0, -1))}><Ionicons name="backspace-outline" size={28} color="#fff" /></TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -226,5 +392,15 @@ const styles = StyleSheet.create({
   cardLabel: { color: '#64748B', fontSize: 13, marginBottom: 12 },
   textInput: { backgroundColor: '#111827', color: '#fff', padding: 15, borderRadius: 12, fontSize: 16, borderWidth: 1, borderColor: '#1F2937', width: '100%' },
   startBtn: { backgroundColor: '#111', borderRadius: 12, width: '100%', height: 55, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#222' },
-  startBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 }
+  startBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  pinOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', zIndex: 999, justifyContent: 'center', alignItems: 'center' },
+  pinCard: { width: '90%', maxWidth: 320, backgroundColor: '#0d0d0d', borderRadius: 24, paddingVertical: 30, alignItems: 'center', borderWidth: 1, borderColor: '#1F2937' },
+  pinTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 30 },
+  redefineText: { color: '#00ff66', fontSize: 12, marginTop: -22, marginBottom: 20, fontWeight: 'bold' },
+  pinDots: { flexDirection: 'row', gap: 15, marginBottom: 35 },
+  pinDot: { width: 14, height: 14, borderRadius: 7, borderWidth: 1, borderColor: '#64748B', backgroundColor: 'transparent' },
+  pinDotFilled: { backgroundColor: '#00ff66', borderColor: '#00ff66' },
+  pinPadRow: { flexDirection: 'row', gap: 20, marginBottom: 15 },
+  pinKey: { width: 66, height: 66, borderRadius: 33, backgroundColor: '#111827', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#1F2937' },
+  pinKeyText: { color: '#fff', fontSize: 26, fontWeight: 'bold' }
 });

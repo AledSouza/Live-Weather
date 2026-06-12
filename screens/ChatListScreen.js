@@ -24,6 +24,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const [optionsModalVisible, setOptionsModalVisible] = useState(false);
   const [chatOptionTarget, setChatOptionTarget] = useState(null);
   const [notifEnabled, setNotifEnabled] = useState(false);
+  const [pinEnabled, setPinEnabled] = useState(false);
 
   const devClicksRef = useRef(0);
   const devTimeoutRef = useRef(null);
@@ -95,9 +96,87 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     const loadNotifState = async () => {
       const state = await AsyncStorage.getItem('@notifications_enabled');
       setNotifEnabled(state === 'true');
+
+      const pinState = await AsyncStorage.getItem('@pin_enabled');
+      setPinEnabled(pinState === 'true');
     };
     loadNotifState();
   }, []);
+
+  const handleTogglePin = async () => {
+    const newVal = !pinEnabled;
+    setPinEnabled(newVal);
+    await AsyncStorage.setItem('@pin_enabled', newVal ? 'true' : 'false');
+    if (newVal) alert('Segurança PIN ativada! Ao abrir o chat, você precisará configurar/digitar seu PIN de 3 dígitos. Cuidado: 3 erros = Limpeza Total (Modo Pânico).');
+    else alert('Segurança PIN desativada.');
+  };
+
+  // 🚀 LÓGICA DE TESTE DO PROTOCOLO PÂNICO (Acionado segurando o cadeado)
+  const handlePanicTest = async () => {
+    alert('TESTE DO PÂNICO INICIADO: Aplicando protocolo de ofuscação...');
+    setLoading(true);
+    try {
+      const myCleanCode = userCode.trim().toLowerCase();
+      
+      // 1. Descobre todos os contatos com quem você já interagiu
+      const { data: msgs } = await supabase.from('mensagens')
+        .select('sender_code, receiver_code, media_url')
+        .or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+        
+      const uniqueContacts = new Set();
+      const filesToDelete = [];
+      if (msgs) {
+        msgs.forEach(m => {
+          if (m.sender_code !== myCleanCode) uniqueContacts.add(m.sender_code);
+          if (m.receiver_code !== myCleanCode) uniqueContacts.add(m.receiver_code);
+          if (m.media_url) filesToDelete.push(m.media_url.split('/').pop());
+        });
+      }
+      if (filesToDelete.length > 0) {
+        await supabase.storage.from('chat-media').remove(filesToDelete);
+      }
+
+      const { data: myConns } = await supabase.from('conexoes').select('friend_code').eq('user_code', myCleanCode);
+      if (myConns) myConns.forEach(c => uniqueContacts.add(c.friend_code));
+
+      // 2. Apaga definitivamente todas as mensagens (limpa o chat)
+      await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+
+      // 3. Renomeia todos os canais (mantendo-os na lista)
+      await supabase.from('conexoes').update({ friend_name: '####' }).eq('user_code', myCleanCode);
+      await supabase.from('conexoes').update({ friend_name: '####' }).eq('friend_code', myCleanCode);
+
+      // Garante que contatos não-salvos também fiquem ofuscados
+      const existingConns = myConns ? myConns.map(c => c.friend_code) : [];
+      const missingConns = Array.from(uniqueContacts).filter(c => !existingConns.includes(c));
+      if (missingConns.length > 0) {
+        await supabase.from('conexoes').insert(
+          missingConns.map(c => ({ user_code: myCleanCode, friend_code: c, friend_name: '####' }))
+        );
+      }
+
+      // 4. Envia a mensagem técnica para cada contato da lista
+      if (uniqueContacts.size > 0) {
+        const coverUpMessages = Array.from(uniqueContacts).map(contact => ({
+          sender_code: myCleanCode,
+          receiver_code: contact,
+          content: 'Parâmetros revisados e aplicados.',
+        }));
+        await supabase.from('mensagens').insert(coverUpMessages);
+      }
+
+      // 5. Limpa os caches locais da memória do dispositivo
+      const keys = await AsyncStorage.getAllKeys();
+      const cacheKeys = keys.filter(k => k.startsWith('@cache_msgs_') || k.startsWith('@queue_') || k.startsWith('@cache_chats_'));
+      if (cacheKeys.length > 0) await AsyncStorage.multiRemove(cacheKeys);
+
+      alert('Teste concluído: Dados ofuscados com sucesso.');
+      fetchMyConversations(); // Recarrega a lista (os canais continuarão visíveis, mas com as ofuscações)
+    } catch (e) {
+      console.error(e);
+      alert('Erro ao executar o teste do pânico.');
+    } finally { setLoading(false); }
+  };
 
   const handleToggleNotifications = async () => {
     const newState = !notifEnabled;
@@ -226,7 +305,8 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   }, [userCode]);
 
   // 🚀 FUNÇÃO: Fixa ou desafixa o chat jogando as flags para a ordenação
-  const handleTogglePin = async (token) => {
+  const handleTogglePinChat = async (token) => {
+ 
     let updatedPins = [...pinnedTokens];
     if (updatedPins.includes(token)) {
       updatedPins = updatedPins.filter(t => t !== token);
@@ -348,6 +428,9 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           </View>
         </View>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <TouchableOpacity style={styles.notifBtn} onPress={handleTogglePin} onLongPress={handlePanicTest} delayLongPress={20000}>
+            <Ionicons name={pinEnabled ? "lock-closed" : "lock-open-outline"} size={20} color={pinEnabled ? "#ef4444" : "#64748B"} />
+          </TouchableOpacity>
           <TouchableOpacity style={styles.notifBtn} onPress={handleToggleNotifications}>
             <Ionicons name={notifEnabled ? "notifications" : "notifications-off"} size={20} color={notifEnabled ? "#00ff66" : "#64748B"} />
           </TouchableOpacity>
@@ -409,7 +492,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Opções do Canal</Text>
             
-            <TouchableOpacity style={styles.optionRowItem} onPress={() => handleTogglePin(chatOptionTarget?.token)}>
+            <TouchableOpacity style={styles.optionRowItem} onPress={() => handleTogglePinChat(chatOptionTarget?.token)}>
               <Ionicons name="pin" size={18} color="#fff" style={{ marginRight: 12, transform: [{ rotate: '45deg' }] }} />
               <Text style={{ color: '#fff', fontSize: 15 }}>{pinnedTokens.includes(chatOptionTarget?.token) ? "Desafixar do Topo" : "Fixar no Topo"}</Text>
             </TouchableOpacity>
