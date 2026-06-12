@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextI
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-// import { OneSignal } from 'react-native-onesignal';
+import { OneSignal } from 'react-native-onesignal';
 import { supabase } from '../supabase';
 
 export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat }) {
@@ -104,16 +104,16 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     setNotifEnabled(newState);
     await AsyncStorage.setItem('@notifications_enabled', newState ? 'true' : 'false');
     if (newState) {
-      // OneSignal.User.pushSubscription.optIn();
+      OneSignal.User.pushSubscription.optIn();
       try {
-        const osId = null; // await OneSignal.User.pushSubscription.getIdAsync();
+        const osId = await OneSignal.User.pushSubscription.getIdAsync();
         if (osId && userCode) {
           await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', userCode.trim().toLowerCase());
         }
       } catch (e) {}
       alert('Notificações de Clima ATIVADAS.');
     } else {
-      // OneSignal.User.pushSubscription.optOut();
+      OneSignal.User.pushSubscription.optOut();
       alert('Notificações de Clima DESATIVADAS.');
     }
   };
@@ -208,13 +208,21 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     // 🚀 GARANTIA: Sincroniza o OneSignal ID mais recente com o servidor
     const syncOsId = async () => {
       try {
-        const osId = null; // await OneSignal.User.pushSubscription.getIdAsync();
+        const osId = await OneSignal.User.pushSubscription.getIdAsync();
         if (osId && userCode) {
           await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', userCode.trim().toLowerCase());
         }
       } catch (e) {}
     };
     syncOsId();
+
+    // 🚀 BLINDAGEM ABSOLUTA: Escuta ativamente o status da OneSignal. Se o ID for gerado com atraso, salva na hora!
+    const handlePushSubscriptionChange = async (event) => {
+      if (event.current.id && userCode) {
+        await supabase.from('perfis').update({ onesignal_id: event.current.id }).eq('connection_code', userCode.trim().toLowerCase());
+      }
+    };
+    OneSignal.User.pushSubscription.addEventListener('change', handlePushSubscriptionChange);
 
     const cleanUserCode = userCode.trim().toLowerCase();
     
@@ -235,6 +243,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     return () => { 
       supabase.removeChannel(channelIncoming); 
       supabase.removeChannel(channelOutgoing); 
+      OneSignal.User.pushSubscription.removeEventListener('change', handlePushSubscriptionChange);
     };
   }, [userCode]);
 

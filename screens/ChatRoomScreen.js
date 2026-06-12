@@ -11,7 +11,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
-// import { OneSignal } from 'react-native-onesignal';
+import { OneSignal } from 'react-native-onesignal';
 import { supabase } from '../supabase';
 import { sendWeatherNotification } from './notificationService';
 
@@ -301,7 +301,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const marcarComoLidas = async () => {
     await supabase.from('mensagens').update({ read_at: new Date(getSyncedTime()).toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
     // Limpa a notificação da gaveta do celular assim que a pessoa entra no chat
-    // OneSignal.Notifications.clearAll();
+    OneSignal.Notifications.clearAll();
   };
 
   const handleTextChange = (text) => {

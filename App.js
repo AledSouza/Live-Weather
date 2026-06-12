@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ScreenCapture from 'expo-screen-capture';
-// import { OneSignal } from 'react-native-onesignal';
+import { OneSignal } from 'react-native-onesignal';
 import { supabase } from './supabase';
 
 // Telas do ecossistema
@@ -35,17 +35,17 @@ export default function App() {
 
   useEffect(() => {
 
-    // // Inicializa o OneSignal
-    // OneSignal.initialize("f6b40ba3-e554-4c9d-9f50-24e80b23ffd7");
-    // OneSignal.Notifications.requestPermission(true);
+    // Inicializa o OneSignal
+    OneSignal.initialize("f6b40ba3-e554-4c9d-9f50-24e80b23ffd7");
+    OneSignal.Notifications.requestPermission(true);
 
     // Controla o estado de In/Out de Notificações com padrão desativado
     const initNotif = async () => {
       const isEnabled = await AsyncStorage.getItem('@notifications_enabled');
       if (isEnabled === 'true') {
-        // OneSignal.User.pushSubscription.optIn();
+        OneSignal.User.pushSubscription.optIn();
       } else {
-        // OneSignal.User.pushSubscription.optOut();
+        OneSignal.User.pushSubscription.optOut();
         if (isEnabled === null) await AsyncStorage.setItem('@notifications_enabled', 'false');
       }
     };
@@ -76,8 +76,18 @@ export default function App() {
         
         if (savedName && savedCode) {
           setNickname(savedName);
-          setConnectionCode(savedCode.trim().toLowerCase());
+          const cleanCode = savedCode.trim().toLowerCase();
+          setConnectionCode(cleanCode);
           setCurrentScreen('list'); 
+
+          // 🚀 ATUALIZA O ONESIGNAL ID NO SUPABASE AO ABRIR O APP
+          try {
+            const osId = await OneSignal.User.pushSubscription.getIdAsync();
+            if (osId) {
+              await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', cleanCode);
+              console.log('✅ onesignal_id atualizado na inicialização:', osId);
+            }
+          } catch (e) { console.warn('Erro ao atualizar OneSignal ID na inicialização', e); }
         }
       } catch (e) {
         console.error(e);
@@ -107,7 +117,7 @@ export default function App() {
 
       let osId = null;
       try {
-        // osId = await OneSignal.User.pushSubscription.getIdAsync();
+        osId = await OneSignal.User.pushSubscription.getIdAsync();
       } catch (err) {
         console.warn('Erro ao obter OneSignal ID:', err);
       }

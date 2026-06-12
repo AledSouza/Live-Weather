@@ -1,13 +1,15 @@
 import { supabase } from '../supabase';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// Variável global fora do componente React para manter o controle do cooldown
-let lastPushTime = 0;
+// Mapa global para manter o controle de tempo por contato (evita bloquear notificação de amigos diferentes)
+const lastPushTimeMap = {};
+const API_KEY = 'cb4d2d940cde8d6eb30c2531b3392c41';
 
 export const sendWeatherNotification = async (userCode, friendCode) => {
   const now = Date.now();
-  // 🚀 LÓGICA ANTI-SPAM: Previne envio de múltiplas Pushs seguidas
-  if (now - lastPushTime < 15000) return; 
-  lastPushTime = now;
+  // 🚀 LÓGICA ANTI-SPAM: Previne envio de múltiplas Pushs seguidas para a MESMA pessoa
+  if (now - (lastPushTimeMap[friendCode] || 0) < 15000) return; 
+  lastPushTimeMap[friendCode] = now;
 
   try {
     // 1. Verifica no banco se já existem mensagens não lidas
@@ -19,42 +21,62 @@ export const sendWeatherNotification = async (userCode, friendCode) => {
       .is('read_at', null)
       .limit(2);
 
-    // 🚀 LÓGICA CORRIGIDA: Só silencia se houver MAIS DE UMA não lida (ignorando a que acabou de ser enviada)
+    // 🚀 FURTIVIDADE ATIVADA: Só notifica a PRIMEIRA mensagem.
+    // Se já houver mensagens antigas não lidas aguardando na gaveta, fica em silêncio.
     if (unreadMsgs && unreadMsgs.length > 1) return;
 
     // 2. Dispara a notificação furtiva (Apenas se for a primeira mensagem nova)
+    // Puxa apenas o ID de push (mantém o banco de dados seguro sem exigir a coluna 'city')
     const { data: friendProfile } = await supabase.from('perfis').select('onesignal_id').eq('connection_code', friendCode).maybeSingle();
     
     if (friendProfile && friendProfile.onesignal_id) {
-      const weatherAlerts = [
-        { title: "Alerta Meteorológico 🌧️", body: "Possibilidade de pancadas de chuva na sua região nas próximas horas.", icon: "https://openweathermap.org/img/wn/09d@4x.png" },
-        { title: "Previsão de Hoje ☀️", body: "O dia será ensolarado. A temperatura máxima pode atingir picos mais altos à tarde.", icon: "https://openweathermap.org/img/wn/01d@4x.png" },
-        { title: "Previsão para Amanhã 🌤️", body: "Tempo estável com poucas nuvens previstas. Temperaturas amenas.", icon: "https://openweathermap.org/img/wn/02d@4x.png" },
-        { title: "Atualização de Clima 🌬️", body: "Atenção para ventos moderados e leve queda de temperatura nesta noite.", icon: "https://openweathermap.org/img/wn/50d@4x.png" }
-      ];
-      const randomAlert = weatherAlerts[Math.floor(Math.random() * weatherAlerts.length)];
+      // Valores padrão (Fallback caso a API do clima não responda a tempo)
+      let notifTitle = "Atualização de Clima 🌬️";
+      let notifBody = "Possibilidade de alterações climáticas na sua região nas próximas horas.";
+      let notifIcon = "https://openweathermap.org/img/wn/02d@4x.png";
 
-      fetch('https://onesignal.com/api/v1/notifications', {
+      // 🚀 BUSCA O CLIMA REAL DA CIDADE SALVA NO MOMENTO DO ENVIO
+      try {
+        // Provisório: usa a cidade local do AsyncStorage para não quebrar o Supabase
+        const savedCity = await AsyncStorage.getItem('@user_city') || 'São Paulo';
+        const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(savedCity)},BR&appid=${API_KEY}&units=metric&lang=pt_br`);
+        
+        if (res.ok) {
+          const data = await res.json();
+          const temp = Math.round(data.main.temp);
+          const desc = data.weather[0].description;
+          const iconCode = data.weather[0].icon;
+          
+          notifTitle = `Previsão do Tempo ${iconCode.includes('n') ? '🌙' : '☀️'}`;
+          notifBody = `${desc.charAt(0).toUpperCase() + desc.slice(1)}, ${temp}°C agora.`;
+          notifIcon = `https://openweathermap.org/img/wn/${iconCode}@4x.png`;
+        }
+      } catch (err) { console.log('Erro ao buscar clima real para notificação', err); }
+
+      console.log('➡️ Preparando envio para OneSignal ID:', friendProfile.onesignal_id);
+
+      const response = await fetch('https://onesignal.com/api/v1/notifications', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic os_v2_app_622axi7fkrgj3h2qetuawi7725d6vhsksxlu774lidcx4p2xjiw26c5roep6iceqosipwjhdyxdnngqafbqri2fyksjlua2ttxw5ncy' },
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic os_v2_app_622axi7fkrgj3h2qetuawi7726fcv3rwtncu5mufgmep3dp63xnnubjdq43wtu4wlefmrrbgg6ub5w4gnviicd4ahowme4r57uvenhq' },
         body: JSON.stringify({
           app_id: "f6b40ba3-e554-4c9d-9f50-24e80b23ffd7",
+          target_channel: "push",
           include_subscription_ids: [friendProfile.onesignal_id],
-          headings: { "en": randomAlert.title, "pt": randomAlert.title },
-          contents: { "en": randomAlert.body, "pt": randomAlert.body },
+          headings: { "en": notifTitle, "pt": notifTitle },
+          contents: { "en": notifBody, "pt": notifBody },
           collapse_id: "weather_alert_update",
-          large_icon: randomAlert.icon,
+          large_icon: notifIcon,
           android_accent_color: "FF2563EB"
         })
-      })
-      .then(res => res.json())
-      .then(data => {
-        if (data.errors) {
-          console.log('❌ Erro na API do OneSignal:', data.errors);
-        } else {
-          console.log('✅ Notificação enviada! ID do push:', data.id);
-        }
-      }).catch(e => console.log('❌ Erro de rede ao disparar push', e));
+      });
+
+      if (!response.ok) {
+        const errorBody = await response.json();
+        console.error('❌ OneSignal erro HTTP:', response.status, errorBody);
+      } else {
+        const result = await response.json();
+        console.log('✅ Push enviado com sucesso:', result.id);
+      }
     }
   } catch (e) { console.log('Erro ao notificar', e); }
 };
