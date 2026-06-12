@@ -3,8 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ScreenCapture from 'expo-screen-capture';
-import { OneSignal } from 'react-native-onesignal';
 import { supabase } from './supabase';
+// import { registerForPushNotificationsAsync } from './screens/notificationService';
 
 // Telas do ecossistema
 import WeatherScreen from './screens/WeatherScreen';
@@ -35,22 +35,6 @@ export default function App() {
 
   useEffect(() => {
 
-    // Inicializa o OneSignal
-    OneSignal.initialize("f6b40ba3-e554-4c9d-9f50-24e80b23ffd7");
-    OneSignal.Notifications.requestPermission(true);
-
-    // Controla o estado de In/Out de Notificações com padrão desativado
-    const initNotif = async () => {
-      const isEnabled = await AsyncStorage.getItem('@notifications_enabled');
-      if (isEnabled === 'true') {
-        OneSignal.User.pushSubscription.optIn();
-      } else {
-        OneSignal.User.pushSubscription.optOut();
-        if (isEnabled === null) await AsyncStorage.setItem('@notifications_enabled', 'false');
-      }
-    };
-    initNotif();
-
     // Previne capturas de tela e oculta o conteúdo do app no multitarefas (Recentes)
     const secureScreen = async () => {
       try {
@@ -80,14 +64,17 @@ export default function App() {
           setConnectionCode(cleanCode);
           setCurrentScreen('list'); 
 
-          // 🚀 ATUALIZA O ONESIGNAL ID NO SUPABASE AO ABRIR O APP
+          // 🚀 ATUALIZA O TOKEN DE NOTIFICAÇÃO NO SUPABASE AO ABRIR O APP
           try {
-            const osId = await OneSignal.User.pushSubscription.getIdAsync();
-            if (osId) {
-              await supabase.from('perfis').update({ onesignal_id: osId }).eq('connection_code', cleanCode);
-              console.log('✅ onesignal_id atualizado na inicialização:', osId);
+            const isEnabled = await AsyncStorage.getItem('@notifications_enabled');
+            if (isEnabled !== 'false') {
+              // const token = await registerForPushNotificationsAsync();
+              // if (token) {
+              //   // Mantém o nome onesignal_id no banco para não quebrar o app em produção
+              //   await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', cleanCode);
+              // }
             }
-          } catch (e) { console.warn('Erro ao atualizar OneSignal ID na inicialização', e); }
+          } catch (e) { console.warn('Erro ao atualizar Token na inicialização', e); }
         }
       } catch (e) {
         console.error(e);
@@ -115,16 +102,16 @@ export default function App() {
       const part2 = Math.random().toString(36).substr(2, 4);
       const generatedCode = `${part1}-${part2}`.toLowerCase();
 
-      let osId = null;
-      try {
-        osId = await OneSignal.User.pushSubscription.getIdAsync();
-      } catch (err) {
-        console.warn('Erro ao obter OneSignal ID:', err);
-      }
+      // let token = null;
+      // try {
+      //   token = await registerForPushNotificationsAsync();
+      // } catch (err) {
+      //   console.warn('Erro ao obter Token de Push:', err);
+      // }
 
-      // Só adiciona o onesignal_id se ele não for nulo, evitando quebrar restrições do banco
+      // Mantém o nome onesignal_id no banco para não quebrar o app em produção
       const novoPerfil = { nickname: nickname.trim(), connection_code: generatedCode };
-      if (osId) novoPerfil.onesignal_id = osId;
+      // if (token) novoPerfil.onesignal_id = token;
 
       const { error } = await supabase
         .from('perfis')

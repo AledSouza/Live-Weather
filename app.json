@@ -20,7 +20,8 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "package": "com.liveweather.app"
+      "package": "com.liveweather.app",
+      "googleServicesFile": "./google-services.json"
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -33,13 +34,7 @@
           "savePhotosPermission": "O aplicativo precisa de permissão para salvar fotos na galeria."
         }
       ],
-      "expo-font",
-      [
-        "onesignal-expo-plugin",
-        {
-          "mode": "production"
-        }
-      ]
+      "expo-font"
     ],
     "extra": {
       "eas": {
