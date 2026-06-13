@@ -21,7 +21,14 @@
       },
       "edgeToEdgeEnabled": true,
       "package": "com.liveweather.app",
-      "googleServicesFile": "./google-services.json"
+      "permissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -38,7 +45,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "c87c4052-75aa-418a-8fb8-45a32a5bfa38"
+        "projectId": "7f2ead80-dd09-4e7e-8b1b-a9d4f09f994d"
       }
     }
   }

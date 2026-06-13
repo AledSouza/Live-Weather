@@ -91,16 +91,21 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [fullscreenImage, setFullscreenImage] = useState(null);
   const [fullscreenVideo, setFullscreenVideo] = useState(null);
 
-  const [isFriendTyping, setIsFriendTyping] = useState(false);
   const [reactionTargetMessage, setReactionTargetMessage] = useState(null);
   const [showCustomEmojiInput, setShowCustomEmojiInput] = useState(false);
   const [infoModalMessage, setInfoModalMessage] = useState(null);
   const [mediaGalleryVisible, setMediaGalleryVisible] = useState(false);
   const [showBlueTicks, setShowBlueTicks] = useState(false);
+  const showBlueTicksRef = useRef(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [recentEmojis, setRecentEmojis] = useState(['👍', '❤️', '😂', '😮', '😢', '🙏']);
   const [friendLastSeen, setFriendLastSeen] = useState(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState(null);
+
+  const setShowBlueTicksSynced = (val) => {
+    showBlueTicksRef.current = val;
+    setShowBlueTicks(val);
+  };
 
   // 🚀 ESTADOS DE GIPHY (STICKERS)
   const [giphyModalVisible, setGiphyModalVisible] = useState(false);
@@ -186,6 +191,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
         const devMode = await AsyncStorage.getItem('@dev_mode');
         setShowBlueTicks(devMode === 'true');
+        setShowBlueTicksSynced(devMode === 'true');
 
         // Carrega as cores salvas deste chat específico
         const savedBg = await AsyncStorage.getItem(`@bg_${userCode}_${friendCode}`);
@@ -449,27 +455,56 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           setMessages((prev) => prev.map((msg) => (msg.id === payload.new.id ? payload.new : msg)));
         }
       })
-      .on('broadcast', { event: 'typing' }, (payload) => {
-        if (payload.payload.sender === friendCode) {
-          setIsFriendTyping(payload.payload.isTyping);
-        }
-      })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'perfis', filter: `connection_code=eq.${friendCode.trim().toLowerCase()}` }, (payload) => {
         if (payload.new && payload.new.last_seen) setFriendLastSeen(payload.new.last_seen);
       })
-      .subscribe();
+      .subscribe((status) => {
+        console.log('Canal status:', status);
+      });
+
+    const pollInterval = setInterval(async () => {
+      try {
+        const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
+        const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
+
+        const { data } = await supabase
+          .from('mensagens')
+          .select('*')
+          .or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`)
+          .order('created_at', { ascending: false })
+          .limit(30);
+        
+        if (data) {
+          const filteredData = data.filter(m => new Date(m.created_at).getTime() > clearedTime);
+          setMessages(prev => {
+            const pendingIds = new Set(pendingQueueRef.current.map(m => m.id));
+            let changed = false;
+            
+            // Atualiza mensagens existentes (ex: read_at preenchido) E adiciona novas
+            const updated = prev.map(p => {
+              const fresh = filteredData.find(m => m.id === p.id);
+              if (fresh && fresh.read_at !== p.read_at) { changed = true; return fresh; }
+              return p;
+            });
+            
+            const existingIds = new Set(prev.map(p => p.id));
+            const newMsgs = filteredData.filter(m => !existingIds.has(m.id) && !pendingIds.has(m.id));
+            if (newMsgs.length > 0) { changed = true; updated.push(...newMsgs); }
+            
+            if (!changed) return prev; // Sem mudanças, não re-renderiza
+            
+            const sorted = updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+            AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(sorted.slice(0, 60))).catch(() => {});
+            return sorted;
+          });
+        }
+      } catch (err) { console.warn('Erro no polling:', err); }
+    }, 5000);
 
     channelRef.current = subscription;
     return () => {
-      subscription.send({ type: 'broadcast', event: 'typing', payload: { sender: userCode, isTyping: false } });
+      clearInterval(pollInterval);
       supabase.removeChannel(subscription);
-      try {
-        channelRef.current?.send({
-          type: 'broadcast',
-          event: 'typing',
-          payload: { sender: userCode, isTyping: false }
-        });
-      } catch(e) {}
       setTimeout(() => supabase.removeChannel(subscription), 300);
     };
   }, [userCode, friendCode]);
@@ -487,12 +522,6 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     
     // 🚀 Removemos o 'await' para não engasgar o teclado ao digitar rápido
     AsyncStorage.setItem(`@draft_${userCode}_${friendCode}`, text).catch(() => {});
-
-    channelRef.current?.send({
-      type: 'broadcast',
-      event: 'typing',
-      payload: { sender: userCode, isTyping: text.trim().length > 0 }
-    });
   };
 
   const handleSendMessage = async () => {
@@ -510,7 +539,6 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       await AsyncStorage.removeItem(`@draft_${userCode}_${friendCode}`);
     } catch (e) { console.error(e); }
 
-    channelRef.current?.send({ type: 'broadcast', event: 'typing', payload: { sender: userCode, isTyping: false } });
 
     let newTime = getSyncedTime();
     if (newTime <= lastMessageTimeRef.current) {
@@ -855,7 +883,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const timeColor = getTimeColor(bubbleBaseColor);
     const bubbleBorder = isMyMessage ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.08)';
 
-    let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicks ? '#38bdf8' : timeColor} style={{ marginLeft: 4 }} />;
+    let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicksRef.current ? '#38bdf8' : timeColor} style={{ marginLeft: 4 }} />;
     if (item.status === 'sending') {
       statusIcon = <Ionicons name="time-outline" size={15} color={timeColor} style={{ marginLeft: 4 }} />;
     } else if (item.status === 'failed') {
@@ -982,8 +1010,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
       <KeyboardAvoidingView 
         style={{ flex: 1 }} 
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        keyboardVerticalOffset={Platform.OS === 'android' ? StatusBar.currentHeight : 0}
+        behavior="padding"
+        keyboardVerticalOffset={Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) + 10 : 0}
       >
         
         <View style={styles.chatHeader}>
@@ -992,8 +1020,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           </TouchableOpacity>
           <View style={styles.headerInfo}>
             <Text style={styles.friendName} numberOfLines={1}>{currentFriendName}</Text>
-            <Text style={[styles.friendStatus, isFriendTyping && { color: '#00ff66', fontWeight: 'bold' }]}>
-              {isFriendTyping ? 'digitando...' : (showBlueTicks && friendLastSeen ? `${friendCode} • ${formatLastSeen(friendLastSeen)}` : friendCode)}
+            <Text style={styles.friendStatus}>
+              {showBlueTicks && friendLastSeen ? `${friendCode} • ${formatLastSeen(friendLastSeen)}` : friendCode}
             </Text>
           </View>
           <TouchableOpacity onPress={() => setTopMenuVisible(true)} style={styles.menuBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
@@ -1014,6 +1042,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               data={[...pendingQueue, ...messages]}
               keyExtractor={(item) => String(item.id)}
               renderItem={renderItem}
+              extraData={showBlueTicks}
               inverted
               contentContainerStyle={[styles.messagesList, { paddingHorizontal: SCREEN_WIDTH < 360 ? 8 : 12 }]} 
               keyboardShouldPersistTaps="handled"
