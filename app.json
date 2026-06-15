@@ -37,8 +37,9 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "O aplicativo precisa acessar suas fotos para salvar mídias.",
-          "savePhotosPermission": "O aplicativo precisa de permissão para salvar fotos na galeria."
+          "photosPermission": "Permitir acesso às fotos para salvar mídias do chat.",
+          "savePhotosPermission": "Permitir salvar fotos e vídeos do chat na galeria.",
+          "isAccessMediaLocationEnabled": false
         }
       ],
       "expo-font"

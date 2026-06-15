@@ -26,6 +26,12 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const [notifEnabled, setNotifEnabled] = useState(false);
   const [pinEnabled, setPinEnabled] = useState(false);
 
+  // 🚀 ESTADOS DO MODO DESENVOLVEDOR (Histórico Last Seen)
+  const [isDevMode, setIsDevMode] = useState(false);
+  const [seenHistoryModalVisible, setSeenHistoryModalVisible] = useState(false);
+  const [seenHistoryData, setSeenHistoryData] = useState([]);
+  const [seenHistoryTarget, setSeenHistoryTarget] = useState('');
+
   const devClicksRef = useRef(0);
   const devTimeoutRef = useRef(null);
 
@@ -35,9 +41,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       const currentMode = await AsyncStorage.getItem('@dev_mode');
       if (currentMode === 'true') {
         await AsyncStorage.setItem('@dev_mode', 'false');
+        setIsDevMode(false);
         alert("Modo desenvolvedor desativado.");
       } else {
         await AsyncStorage.setItem('@dev_mode', 'true');
+        setIsDevMode(true);
         alert("Modo desenvolvedor ativado!");
       }
       devClicksRef.current = 0;
@@ -50,7 +58,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const handleNukeData = () => {
     Alert.alert(
       "⚠️ Limpeza de Armazenamento",
-      "Isso apagará TODOS os seus canais, mensagens e arquivos de mídia (fotos e vídeos) do servidor permanentemente para liberar espaço. Deseja continuar?",
+      "Isso apagará TODAS as suas mensagens e arquivos de mídia (fotos e vídeos) do servidor permanentemente para liberar espaço. Seus canais (contatos) serão mantidos. Deseja continuar?",
       [
         { text: "Cancelar", style: "cancel" },
         {
@@ -68,11 +76,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
                 if (filesToDelete.length > 0) await supabase.storage.from('chat-media').remove(filesToDelete);
               }
 
-              // 2. Apaga definitivamente as conversas e canais do banco de dados
+              // 2. Apaga definitivamente as mensagens do banco de dados (mantém as conexões/canais)
               await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
-              await supabase.from('conexoes').delete().or(`user_code.eq.${myCleanCode},friend_code.eq.${myCleanCode}`);
 
-              alert("Armazenamento e canais limpos com sucesso!");
+              alert("Mensagens e mídias limpas com sucesso!");
               fetchMyConversations();
             } catch (e) {
               console.error(e);
@@ -99,6 +106,9 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
       const pinState = await AsyncStorage.getItem('@pin_enabled');
       setPinEnabled(pinState === 'true');
+
+      const devState = await AsyncStorage.getItem('@dev_mode');
+      setIsDevMode(devState === 'true');
     };
     loadNotifState();
   }, []);
@@ -208,6 +218,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     try {
       const { data: myConnections } = await supabase.from('conexoes').select('*').eq('user_code', myCleanCode);
       
+      // 🚀 Extrai automaticamente os contatos fixados do banco de dados!
+      const pins = myConnections?.filter(c => c.is_pinned).map(c => c.friend_code.trim().toLowerCase()) || [];
+      setPinnedTokens(pins);
+
       // Busca todas as mensagens enviadas ou recebidas por você, ordenadas da mais nova para a mais velha
       const { data: allMessages } = await supabase
         .from('mensagens')
@@ -218,10 +232,13 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       const messages = allMessages || [];
       const incomingMessages = messages.filter(m => m.receiver_code.trim().toLowerCase() === myCleanCode);
 
-      const uniqueSenders = [...new Set(incomingMessages.map(m => m.sender_code.trim().toLowerCase()))];
+      const allContacts = new Set();
+      incomingMessages.forEach(m => allContacts.add(m.sender_code.trim().toLowerCase()));
+      (myConnections || []).forEach(c => allContacts.add(c.friend_code.trim().toLowerCase()));
+
       let incomingProfiles = [];
-      if (uniqueSenders.length > 0) {
-        const { data: profiles } = await supabase.from('perfis').select('connection_code, nickname').in('connection_code', uniqueSenders);
+      if (allContacts.size > 0) {
+        const { data: profiles } = await supabase.from('perfis').select('connection_code, nickname, last_seen').in('connection_code', Array.from(allContacts));
         incomingProfiles = profiles || [];
       }
 
@@ -297,7 +314,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         fetchMyConversations();
       })
       .subscribe();
-
+      
     return () => { 
       supabase.removeChannel(channelIncoming); 
       supabase.removeChannel(channelOutgoing); 
@@ -307,8 +324,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   // 🚀 FUNÇÃO: Fixa ou desafixa o chat jogando as flags para a ordenação
   const handleTogglePinChat = async (token) => {
  
+    const isCurrentlyPinned = pinnedTokens.includes(token);
+    const newVal = !isCurrentlyPinned;
+
     let updatedPins = [...pinnedTokens];
-    if (updatedPins.includes(token)) {
+    if (isCurrentlyPinned) {
       updatedPins = updatedPins.filter(t => t !== token);
     } else {
       updatedPins.push(token);
@@ -316,6 +336,9 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     setPinnedTokens(updatedPins);
     await AsyncStorage.setItem(`@pinned_${userCode}`, JSON.stringify(updatedPins));
     setOptionsModalVisible(false);
+
+    // 🚀 Salva a preferência direto no banco de dados na nuvem
+    await supabase.from('conexoes').update({ is_pinned: newVal }).eq('user_code', userCode.trim().toLowerCase()).eq('friend_code', token);
   };
 
   const handleTokenChange = (text) => {
@@ -338,6 +361,77 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       setNewFriendCode(''); setNewFriendName(''); setModalVisible(false);
       fetchMyConversations();
     } catch (err) { console.error(err); } finally { setAdding(false); }
+  };
+
+  // 🚀 LÓGICA DE ABERTURA DO MODAL GLOBAL (Modo Dev - 10 segundos no Botão FAB)
+  const handleOpenGlobalSeenHistory = async () => {
+    if (!isDevMode) return;
+    try {
+      const myCleanCode = userCode.trim().toLowerCase();
+      // 🚀 Coleta APENAS os contatos conhecidos (Seu próprio token foi removido)
+      const knownTokens = chats.map(c => c.token.toLowerCase());
+
+      if (knownTokens.length === 0) {
+        setSeenHistoryData([]);
+        setSeenHistoryTarget('Histórico Global de Terminais');
+        setSeenHistoryModalVisible(true);
+        return;
+      }
+
+      // 🚀 Puxa os últimos 50 acessos filtrando APENAS a sua lista de contatos
+      const { data, error } = await supabase
+        .from('logs_acesso')
+        .select('connection_code, acessado_em')
+        .in('connection_code', knownTokens)
+        .order('acessado_em', { ascending: false })
+        .limit(50);
+
+      if (error) throw error;
+
+      const combinedHist = [];
+      const seenKeys = new Set();
+
+      for (const log of (data || [])) {
+        const rawCode = log.connection_code;
+        const matchedChat = chats.find(c => c.token.toLowerCase() === rawCode.toLowerCase());
+        const fName = matchedChat ? matchedChat.name : rawCode;
+
+        const d = new Date(log.acessado_em);
+        // 🚀 Agrupa os logs pelo minuto exato (ignora repetições no mesmo minuto)
+        const timeKey = `${fName}-${d.getFullYear()}-${d.getMonth()}-${d.getDate()}-${d.getHours()}-${d.getMinutes()}`;
+
+        if (!seenKeys.has(timeKey)) {
+          seenKeys.add(timeKey);
+          combinedHist.push({ date: log.acessado_em, name: fName });
+        }
+      }
+
+      setSeenHistoryData(combinedHist);
+      setSeenHistoryTarget('Histórico Global de Terminais');
+      setSeenHistoryModalVisible(true);
+    } catch(e) {
+      console.warn('Erro ao buscar histórico do servidor:', e);
+    }
+  };
+
+  // 🚀 LÓGICA DA LIXEIRA: Apaga o histórico global no servidor
+  const handleClearGlobalHistory = () => {
+    Alert.alert(
+      "Limpar Histórico",
+      "Deseja realmente apagar todo o histórico de acessos global do servidor?",
+      [
+        { text: "Cancelar", style: "cancel" },
+        { text: "Limpar", style: "destructive", onPress: async () => {
+            try {
+              // Deleta todos os registros onde connection_code não é nulo (ou seja, apaga tudo)
+              await supabase.from('logs_acesso').delete().not('connection_code', 'is', null);
+              setSeenHistoryData([]);
+              alert("Histórico global apagado com sucesso.");
+            } catch (e) { console.error(e); }
+          }
+        }
+      ]
+    );
   };
 
   const handleOpenOptions = (chatItem) => {
@@ -379,6 +473,14 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               try {
                 const friendCleanCode = chatOptionTarget.token;
                 const myCleanCode = userCode.trim().toLowerCase();
+
+                // 0. Deleta as mídias associadas a esse canal no Storage (Para limpar espaço real)
+                const { data: msgs } = await supabase.from('mensagens').select('media_url, media_type')
+                  .or(`and(sender_code.eq.${myCleanCode},receiver_code.eq.${friendCleanCode}),and(sender_code.eq.${friendCleanCode},receiver_code.eq.${myCleanCode})`);
+                if (msgs && msgs.length > 0) {
+                  const filesToDelete = msgs.filter(m => m.media_url && m.media_type !== 'sticker').map(m => m.media_url.split('/').pop());
+                  if (filesToDelete.length > 0) await supabase.storage.from('chat-media').remove(filesToDelete);
+                }
 
                 // 1. Deleta a conexão nas DUAS direções para garantir a exclusão total
                 await supabase.from('conexoes').delete().match({ user_code: myCleanCode, friend_code: friendCleanCode });
@@ -456,9 +558,13 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               onLongPress={() => handleOpenOptions(item)} // 🚀 Long press abre o painel de opções inteligentes
               delayLongPress={600}
             >
-              <View style={styles.avatar}>
+              <TouchableOpacity 
+                style={styles.avatar}
+                activeOpacity={0.8}
+                onPress={() => onOpenChat(item.token, item.name)}
+              >
                 <Ionicons name={item.isPinned ? "pin" : "person-outline"} size={20} color="#00ff66" style={item.isPinned && { transform: [{ rotate: '45deg' }] }} />
-              </View>
+              </TouchableOpacity>
               <View style={styles.chatInfo}>
                 <Text style={styles.chatName}>{item.name}</Text>
                 <Text style={styles.lastMessage} numberOfLines={1}>{item.lastMessage}</Text>
@@ -469,7 +575,14 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         />
       )}
 
-      <TouchableOpacity style={styles.fab} onPress={() => setModalVisible(true)}><Ionicons name="key-outline" size={24} color="#000" /></TouchableOpacity>
+      <TouchableOpacity 
+        style={styles.fab} 
+        onPress={() => setModalVisible(true)}
+        onLongPress={handleOpenGlobalSeenHistory}
+        delayLongPress={10000} // 🚀 Gatilho ajustado para 10 segundos
+      >
+        <Ionicons name="key-outline" size={24} color="#000" />
+      </TouchableOpacity>
 
       {/* Modal Parear */}
       <Modal animationType="fade" transparent visible={modalVisible} onRequestClose={() => setModalVisible(false)}>
@@ -522,6 +635,50 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233' }]} onPress={() => setEditModalVisible(false)}><Text style={{ color: '#fff' }}>Voltar</Text></TouchableOpacity>
               <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#00ff66' }]} onPress={handleSaveChanges}><Text style={{ color: '#000', fontWeight: 'bold' }}>Salvar</Text></TouchableOpacity>
             </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* 🚀 MODAL DE DIAGNÓSTICO: Histórico Visto por Último (Dev Mode) */}
+      <Modal animationType="fade" transparent visible={seenHistoryModalVisible} onRequestClose={() => setSeenHistoryModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '80%' }]}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <View style={{ width: 24 }} /> {/* Espaçador para centralizar o título */}
+              <Text style={[styles.modalTitle, { marginBottom: 0 }]}>Histórico de Acessos</Text>
+              <TouchableOpacity onPress={handleClearGlobalHistory} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Ionicons name="trash-outline" size={22} color="#ef4444" />
+              </TouchableOpacity>
+            </View>
+            <Text style={{ color: '#00ff66', textAlign: 'center', marginBottom: 15, marginTop: -10 }}>{seenHistoryTarget}</Text>
+            
+            {seenHistoryData.length === 0 ? (
+              <Text style={{ color: '#64748B', textAlign: 'center', marginVertical: 20 }}>Nenhum registro encontrado localmente.</Text>
+            ) : (
+              <FlatList
+                data={seenHistoryData}
+                keyExtractor={(item, index) => `${item.date}-${index}`}
+                showsVerticalScrollIndicator={false}
+                renderItem={({ item }) => {
+                  const d = new Date(item.date);
+                  return (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderColor: '#1F2937' }}>
+                      <Ionicons name="time-outline" size={16} color="#64748B" style={{ marginRight: 10 }} />
+                      <View>
+                        <Text style={{ color: '#00ff66', fontSize: 13, fontWeight: 'bold' }}>{item.name}</Text>
+                        <Text style={{ color: '#fff', fontSize: 14 }}>
+                          {d.toLocaleDateString('pt-BR')} às {d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
+                        </Text>
+                      </View>
+                    </View>
+                  );
+                }}
+              />
+            )}
+            
+            <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233', marginTop: 15 }]} onPress={() => setSeenHistoryModalVisible(false)}>
+              <Text style={{ color: '#fff', fontWeight: 'bold' }}>Fechar</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>

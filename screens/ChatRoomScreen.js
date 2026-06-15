@@ -1,15 +1,16 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity,
   SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform, Linking,
   StatusBar, Modal, Image, Animated, PanResponder, useWindowDimensions, ScrollView,
-  ImageBackground
+  ImageBackground, Alert, BackHandler
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { Video, ResizeMode } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
+import * as ScreenCapture from 'expo-screen-capture';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 // import * as Notifications from 'expo-notifications';
@@ -101,6 +102,123 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [recentEmojis, setRecentEmojis] = useState(['👍', '❤️', '😂', '😮', '😢', '🙏']);
   const [friendLastSeen, setFriendLastSeen] = useState(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState(null);
+  const [renderKey, setRenderKey] = useState(0);
+  const [pinnedMessage, setPinnedMessage] = useState(null);
+
+  const roomKey = [userCode.trim().toLowerCase(), friendCode.trim().toLowerCase()].sort().join('-');
+
+  // 🚀 LÓGICA DE EXCEÇÃO DE PRIVACIDADE: Libera o print/gravação de tela APENAS ao ver mídias em tela cheia
+  useEffect(() => {
+    const toggleScreenCapture = async () => {
+      if (Platform.OS === 'web') return; // Evita crash no navegador
+      try {
+        if (fullscreenImage || fullscreenVideo) {
+          await ScreenCapture.allowScreenCaptureAsync(); // Desliga o escudo
+        } else {
+          await ScreenCapture.preventScreenCaptureAsync(); // Religa o escudo ao fechar a mídia
+        }
+      } catch (e) {
+        console.warn('Erro ao alternar proteção de tela:', e);
+      }
+    };
+    toggleScreenCapture();
+  }, [fullscreenImage, fullscreenVideo]);
+
+  // 🚀 LÓGICA DE BOTÃO VOLTAR: Fecha a mídia em tela cheia se estiver aberta ao invés de sair do chat
+  useEffect(() => {
+    const backAction = () => {
+      if (fullscreenImage) {
+        setFullscreenImage(null);
+        return true;
+      }
+      if (fullscreenVideo) {
+        setFullscreenVideo(null);
+        return true;
+      }
+      return false; // Permite que o botão Voltar faça o comportamento padrão (sair do chat) se as mídias estiverem fechadas
+    };
+    const backHandler = BackHandler.addEventListener('hardwareBackPress', backAction);
+    return () => backHandler.remove();
+  }, [fullscreenImage, fullscreenVideo]);
+
+  const fetchPinnedMessage = async () => {
+    try {
+      // 🚀 Mudamos maybeSingle() para limit(1) que NUNCA trava, mesmo se houver pins duplicados no banco
+      const { data: pinDataList, error: pinError } = await supabase
+        .from('pins')
+        .select('*')
+        .eq('room_key', roomKey)
+        .limit(1)
+
+      if (pinError || !pinDataList || pinDataList.length === 0 || !pinDataList[0]?.message_id) {
+        setPinnedMessage(null);
+        return;
+      }
+
+      const { data: msgDataList, error: msgError } = await supabase
+        .from('mensagens')
+        .select('*')
+        .eq('id', pinDataList[0].message_id)
+        .limit(1);
+
+      if (!msgError && msgDataList && msgDataList.length > 0) {
+        setPinnedMessage(msgDataList[0]);
+      } else {
+        // 🚀 Removemos a autodeleção do pin para evitar que instabilidades na internet o apagassem acidentalmente
+        setPinnedMessage(null);
+      }
+    } catch (e) {
+      console.warn('Erro ao buscar pin:', e);
+    }
+  };
+
+  const handlePinMessage = async (message) => {
+    // 🚀 Previne o app de tentar fixar uma mensagem que ainda está na fila de envio ou sem ID oficial
+    if (message.status === 'sending' || message.status === 'failed' || String(message.id).startsWith('pending') || String(message.id).startsWith('temp')) {
+      alert('Aguarde a mensagem ser enviada e confirmada pelo servidor antes de fixá-la.');
+      return;
+    }
+
+    if (pinnedMessage?.id === message.id) return handleUnpinMessage();
+    try {
+      // 🚀 Excluímos o pin antigo manualmente para garantir que não haja duplicidade sem precisar de restrições em SQL
+      await supabase.from('pins').delete().eq('room_key', roomKey);
+      
+      const { error } = await supabase.from('pins').insert([
+        { message_id: message.id, pinned_by: userCode, room_key: roomKey }
+      ]);
+
+      if (error) throw error;
+
+      setPinnedMessage(message);
+      setInfoModalMessage(null);
+      setReactionTargetMessage(null);
+    } catch (e) { 
+      console.warn('Erro ao fixar:', e); 
+      alert(`Falha do Servidor: ${e.message || 'A mensagem não pôde ser fixada.'}`);
+    }
+  };
+
+  const handleUnpinMessage = async () => {
+    try {
+      await supabase.from('pins').delete().eq('room_key', roomKey);
+      setPinnedMessage(null);
+      setInfoModalMessage(null);
+      setReactionTargetMessage(null);
+    } catch (e) { console.warn('Erro ao desafixar:', e); }
+  };
+
+  const getDateLabel = (isoString) => {
+    if (!isoString) return '';
+    const date = new Date(isoString);
+    const today = new Date(getSyncedTime());
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const isSameDay = (a, b) => a.getDate() === b.getDate() && a.getMonth() === b.getMonth() && a.getFullYear() === b.getFullYear();
+    if (isSameDay(date, today)) return 'Hoje';
+    if (isSameDay(date, yesterday)) return 'Ontem';
+    return date.toLocaleDateString('pt-BR', { day: '2-digit', month: 'long', year: 'numeric' });
+  };
 
   const setShowBlueTicksSynced = (val) => {
     showBlueTicksRef.current = val;
@@ -114,7 +232,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [isSearchingGiphy, setIsSearchingGiphy] = useState(false);
   const [giphyError, setGiphyError] = useState(null);
   const [recentGifs, setRecentGifs] = useState([]);
-  const [giphyTab, setGiphyTab] = useState('search'); // 'search' ou 'recent'
+  const [giphyTab, setGiphyTab] = useState('recent'); // 'search' ou 'recent'
   const GIPHY_API_KEY = 'u9JYVOpH3aNfJmB3qJWc5E42ln1kiwr9'; // Chave pessoal da API Giphy
 
   // 🚀 ESTADOS DE PERSONALIZAÇÃO (CORES RGB)
@@ -142,6 +260,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const touchStartX = useRef(0);
   const touchStartY = useRef(0);
   const isScrolling = useRef(false);
+  const marcarLidasDebounceRef = useRef(null);
 
   // 🚀 LÓGICA DE VISTO POR ÚLTIMO
   const formatLastSeen = (isoString) => {
@@ -419,8 +538,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     };
 
     fetchMessages();
+    fetchPinnedMessage();
 
-    const roomKey = [userCode.trim().toLowerCase(), friendCode.trim().toLowerCase()].sort().join('-');
     const subscription = supabase
       .channel(`room-${roomKey}`, { config: { broadcast: { ack: true } } })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'mensagens' }, (payload) => {
@@ -458,6 +577,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'perfis', filter: `connection_code=eq.${friendCode.trim().toLowerCase()}` }, (payload) => {
         if (payload.new && payload.new.last_seen) setFriendLastSeen(payload.new.last_seen);
       })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'pins', filter: `room_key=eq.${roomKey}` }, (payload) => {
+        if (payload.eventType === 'DELETE') setPinnedMessage(null);
+        if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') fetchPinnedMessage();
+      })
       .subscribe((status) => {
         console.log('Canal status:', status);
       });
@@ -475,6 +598,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           .limit(30);
         
         if (data) {
+          const hasUnread = data.some(m => 
+            m.sender_code === friendCode && 
+            m.receiver_code === userCode && 
+            !m.read_at
+          );
+          if (hasUnread) marcarComoLidas();
+
           const filteredData = data.filter(m => new Date(m.created_at).getTime() > clearedTime);
           setMessages(prev => {
             const pendingIds = new Set(pendingQueueRef.current.map(m => m.id));
@@ -483,7 +613,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             // Atualiza mensagens existentes (ex: read_at preenchido) E adiciona novas
             const updated = prev.map(p => {
               const fresh = filteredData.find(m => m.id === p.id);
-              if (fresh && fresh.read_at !== p.read_at) { changed = true; return fresh; }
+              if (fresh && (fresh.read_at !== p.read_at || JSON.stringify(fresh.reacoes) !== JSON.stringify(p.reacoes))) { changed = true; return fresh; }
               return p;
             });
             
@@ -505,15 +635,18 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     return () => {
       clearInterval(pollInterval);
       supabase.removeChannel(subscription);
-      setTimeout(() => supabase.removeChannel(subscription), 300);
     };
   }, [userCode, friendCode]);
 
   const marcarComoLidas = async () => {
-    await syncTimeWithServer();
-    await supabase.from('mensagens').update({ read_at: new Date(getSyncedTime()).toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
-    // Limpa a notificação da gaveta do celular assim que a pessoa entra no chat
-    // await Notifications.dismissAllNotificationsAsync();
+    if (marcarLidasDebounceRef.current) return; // já agendado
+    marcarLidasDebounceRef.current = setTimeout(async () => {
+      marcarLidasDebounceRef.current = null;
+      await syncTimeWithServer();
+      await supabase.from('mensagens').update({ read_at: new Date(getSyncedTime()).toISOString() }).eq('sender_code', friendCode).eq('receiver_code', userCode).is('read_at', null);
+      // Limpa a notificação da gaveta do celular assim que a pessoa entra no chat
+      // await Notifications.dismissAllNotificationsAsync();
+    }, 1000);
   };
 
   const handleTextChange = (text) => {
@@ -599,6 +732,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       setRecentEmojis(prev => {
         const updated = [emoji, ...prev.filter(e => e !== emoji)].slice(0, 6);
         AsyncStorage.setItem('@recent_emojis', JSON.stringify(updated)).catch(() => {});
+        setRenderKey(k => k + 1);
         return updated;
       });
     } catch (err) { console.error(err); }
@@ -614,12 +748,21 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (err) { console.error(err); }
   };
 
-  const handleUploadAndSendMedia = async (uri, mediaType) => {
+  const handleUploadAndSendMedia = async (uri, mediaType, fileSize) => {
     const tempTime = getSyncedTime();
     const tempId = `temp-${tempTime}`;
+    
+    // 🚀 Formata o tamanho do arquivo para MB ou KB
+    let sizeStr = '';
+    if (fileSize) {
+      const mb = fileSize / (1024 * 1024);
+      sizeStr = mb < 1 ? (fileSize / 1024).toFixed(0) + ' KB' : mb.toFixed(1) + ' MB';
+    }
+    const finalContent = sizeStr || (mediaType === 'video' ? '📹 Vídeo' : '📷 Foto');
+
     try {
       setUploading(true);
-      setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date(tempTime).toISOString(), is_uploading: true }, ...prev]);
+      setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: sizeStr || 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date(tempTime).toISOString(), is_uploading: true }, ...prev]);
 
       const ext = mediaType === 'video' ? 'mp4' : 'jpg';
       const filename = `${userCode}-${tempTime}.${ext}`;
@@ -646,7 +789,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       const newPendingMessage = {
         id: `pending-${newTime}-${Math.random()}`,
-        content: mediaType === 'video' ? '📹 Vídeo enviado' : '📩 Arquivo de mídia enviado',
+        content: finalContent,
         media_url: mediaUrl,
         media_type: mediaType,
         sender_code: userCode,
@@ -665,29 +808,59 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } finally { setUploading(false); }
   };
 
-  const handleDownloadMedia = async (url) => {
+  const handleDownloadMedia = async (url, mediaType = 'image') => {
     try {
+      // 🚀 Proteção Web para Download de Mídia
+      if (Platform.OS === 'web') {
+        alert('No navegador (Web), clique com o botão direito ou segure a imagem/vídeo para salvar.');
+        return;
+      }
+
       if (setPickerActive) setPickerActive(true); // Previne o lock da tela ao abrir o modal de permissão nativo
-      const { status } = await MediaLibrary.requestPermissionsAsync(true);
+      const { status, canAskAgain } = await MediaLibrary.requestPermissionsAsync(true); // 🚀 writeOnly: Pede apenas Escrita (ignora Áudio e Leitura da Galeria)
       if (status !== 'granted') {
         if (setPickerActive) setPickerActive(false);
-        return alert('Permissão necessária para salvar na galeria.');
+        Alert.alert(
+          'Permissão necessária',
+          canAskAgain
+            ? 'Permita o acesso para salvar mídias.'
+            : 'Vá em Configurações > Aplicativos > [seu app] > Permissões e habilite Fotos/Mídia.',
+          [{ text: 'OK' }]
+        );
+        return;
       }
       
-      // Remove query params e garante que exista uma extensão de arquivo válida
-      const rawFilename = url.split('/').pop().split('?')[0];
-      const filename = rawFilename.includes('.') ? rawFilename : `${rawFilename}.jpg`;
-      const fileUri = `${FileSystem.documentDirectory}${filename}`;
+      let uriToSave = url;
+
+      // 🚀 Se a URL for da internet (Supabase), nós baixamos o arquivo primeiro
+      if (url.startsWith('http')) {
+        // Remove query params e garante que exista uma extensão de arquivo válida
+        const rawFilename = url.split('/').pop().split('?')[0];
+        const fallbackExt = mediaType === 'video' ? 'mp4' : 'jpg';
+        const filename = rawFilename.includes('.') ? rawFilename : `${rawFilename}.${fallbackExt}`;
+        
+        // Usa documentDirectory (permanente). O Android aborta a cópia de vídeos se estiverem no cache!
+        const fileUri = `${FileSystem.documentDirectory}${Date.now()}-${filename}`;
+        const downloadRes = await FileSystem.downloadAsync(url, fileUri);
+        
+        const fileInfo = await FileSystem.getInfoAsync(downloadRes.uri);
+        if (!fileInfo.exists || (typeof fileInfo.size === 'number' && fileInfo.size === 0)) {
+          throw new Error('Arquivo baixado está vazio ou corrompido');
+        }
+        uriToSave = downloadRes.uri;
+      }
+
+      // 🚀 Cria o Asset na pasta "Pictures" / "Movies" (Google Fotos indexa na hora!)
+      await MediaLibrary.createAssetAsync(uriToSave);
       
-      const downloadRes = await FileSystem.downloadAsync(url, fileUri);
-      await MediaLibrary.saveToLibraryAsync(downloadRes.uri);
+      // 🚀 REMOVIDO: FileSystem.deleteAsync. Apagar o arquivo na mão estava causando o bug de sumir da galeria.
       
       if (setPickerActive) setPickerActive(false);
-      alert('Mídia salva na galeria com sucesso!');
+      Alert.alert('Salvo!', 'Mídia salva na galeria com sucesso.');
     } catch (err) {
       if (setPickerActive) setPickerActive(false);
-      console.error(err);
-      alert('Erro ao salvar o arquivo: ' + err.message);
+      console.error('Download error:', err);
+      Alert.alert('Erro ao salvar', err.message ?? JSON.stringify(err));
     }
   };
 
@@ -705,17 +878,37 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       let result = null;
       if (type === 'camera_photo') {
-        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, allowsEditing: false });
+        result = await ImagePicker.launchCameraAsync({ 
+          mediaTypes: ImagePicker.MediaTypeOptions.Images, 
+          allowsEditing: false,
+          quality: 0.5 // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
+        });
       } else if (type === 'camera_video') {
-        result = await ImagePicker.launchCameraAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Videos, allowsEditing: false });
+        result = await ImagePicker.launchCameraAsync({ 
+          mediaTypes: ImagePicker.MediaTypeOptions.Videos, 
+          allowsEditing: false,
+          videoQuality: 0 // 🚀 Grava o vídeo em menor resolução para economizar banco de dados
+        });
       } else if (type === 'gallery') {
-        result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, allowsMultipleSelection: false });
+        result = await ImagePicker.launchImageLibraryAsync({ 
+          mediaTypes: ImagePicker.MediaTypeOptions.All, 
+          allowsMultipleSelection: false,
+          quality: 0.5, // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
+          videoQuality: 0 // 🚀 Comprime os vídeos da galeria (suportado no iOS)
+        });
       }
 
       if (setPickerActive) setPickerActive(false);
 
       if (result && !result.canceled && result.assets && result.assets[0].uri) {
-          await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image');
+          let finalFileSize = result.assets[0].fileSize;
+          if (!finalFileSize) {
+            try {
+              const fileInfo = await FileSystem.getInfoAsync(result.assets[0].uri);
+              finalFileSize = fileInfo.size;
+            } catch (e) {}
+          }
+          await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image', finalFileSize);
       }
     } catch (err) { 
       if (setPickerActive) setPickerActive(false);
@@ -740,22 +933,37 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (err) { console.error(err); }
   };
 
-  const handleClearChat = async () => {
-    try {
-      // Extrai o nome dos arquivos (fotos/vídeos) e os apaga do balde de armazenamento
-      const mediaMessages = messages.filter(m => m.media_url && m.media_type !== 'sticker');
-      if (mediaMessages.length > 0) {
-        const filesToDelete = mediaMessages.map(m => m.media_url.split('/').pop());
-        await supabase.storage.from('chat-media').remove(filesToDelete);
-      }
-      
-      // Deleta definitivamente as mensagens do banco de dados (para os dois usuários)
-      await supabase.from('mensagens').delete().match({ sender_code: userCode, receiver_code: friendCode });
-      await supabase.from('mensagens').delete().match({ sender_code: friendCode, receiver_code: userCode });
-      setMessages([]);
-      AsyncStorage.removeItem(`@cache_msgs_${userCode}_${friendCode}`).catch(() => {});
-      setTopMenuVisible(false);
-    } catch (err) { console.error(err); }
+  const handleClearChat = () => {
+    setTopMenuVisible(false);
+    setTimeout(() => {
+      Alert.alert(
+        "Limpar Mensagens",
+        "Deseja apagar todas as mensagens permanentemente para você e para o contato?",
+        [
+          { text: "Cancelar", style: "cancel" },
+          {
+            text: "Limpar",
+            style: "destructive",
+            onPress: async () => {
+              try {
+                // Extrai o nome dos arquivos (fotos/vídeos) e os apaga do balde de armazenamento
+                const mediaMessages = messages.filter(m => m.media_url && m.media_type !== 'sticker');
+                if (mediaMessages.length > 0) {
+                  const filesToDelete = mediaMessages.map(m => m.media_url.split('/').pop());
+                  await supabase.storage.from('chat-media').remove(filesToDelete);
+                }
+                
+                // Deleta definitivamente as mensagens do banco de dados (para os dois usuários)
+                await supabase.from('mensagens').delete().match({ sender_code: userCode, receiver_code: friendCode });
+                await supabase.from('mensagens').delete().match({ sender_code: friendCode, receiver_code: userCode });
+                setMessages([]);
+                AsyncStorage.removeItem(`@cache_msgs_${userCode}_${friendCode}`).catch(() => {});
+              } catch (err) { console.error(err); }
+            }
+          }
+        ]
+      );
+    }, 300);
   };
 
   const saveColor = async (type, color) => {
@@ -839,7 +1047,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
   };
 
-  const renderItem = ({ item }) => {
+  const renderItem = useCallback(({ item, index }) => {
+    const allData = [...pendingQueue, ...messages];
+    const nextItem = allData[index + 1];
+    const showDateSeparator = !nextItem || getDateLabel(item.created_at) !== getDateLabel(nextItem.created_at);
+
     const isMyMessage = item.sender_code === userCode;
     const timeString = new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
@@ -883,7 +1095,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const timeColor = getTimeColor(bubbleBaseColor);
     const bubbleBorder = isMyMessage ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.08)';
 
-    let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicksRef.current ? '#38bdf8' : timeColor} style={{ marginLeft: 4 }} />;
+    let statusIcon = <Ionicons name="checkmark-done" size={15} color={item.read_at && showBlueTicks ? '#38bdf8' : timeColor} style={{ marginLeft: 4 }} />;
     if (item.status === 'sending') {
       statusIcon = <Ionicons name="time-outline" size={15} color={timeColor} style={{ marginLeft: 4 }} />;
     } else if (item.status === 'failed') {
@@ -893,10 +1105,18 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const isHighlighted = item.id === highlightedMessageId;
 
     return (
-      <SwipeableMessage onReply={() => setReplyingTo(item)}>
-        <TouchableOpacity
-          activeOpacity={0.9}
-          onPressIn={(e) => {
+      <View style={{ width: '100%' }}>
+        {showDateSeparator && (
+          <View style={styles.dateSeparator}>
+            <View style={styles.dateSeparatorLine} />
+            <Text style={styles.dateSeparatorText}>{getDateLabel(item.created_at)}</Text>
+            <View style={styles.dateSeparatorLine} />
+          </View>
+        )}
+        <SwipeableMessage onReply={() => setReplyingTo(item)}>
+          <TouchableOpacity
+            activeOpacity={0.9}
+            onPressIn={(e) => {
             touchStartX.current = e.nativeEvent.pageX;
             touchStartY.current = e.nativeEvent.pageY;
             isScrolling.current = false;
@@ -957,7 +1177,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           {quotedMsg && (
             <TouchableOpacity activeOpacity={0.8} onPress={() => handleScrollToMessage(quotedMsg.id)}>
               <View style={styles.quoteInsideBubble}>
-                <Text style={styles.quoteInsideText} numberOfLines={1}>{quotedMsg.content}</Text>
+                <Text style={styles.quoteInsideText} numberOfLines={1}>
+                  {quotedMsg.media_url ? (quotedMsg.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : quotedMsg.content}
+                </Text>
               </View>
             </TouchableOpacity>
           )}
@@ -968,7 +1190,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#1E293B', overflow: 'hidden', justifyContent: 'center', alignItems: 'center' }]}>
                   <Video source={{ uri: item.media_url }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted={true} />
                   <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 24 }}><Ionicons name="play-circle" size={48} color="#fff" /></View>
-                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
+                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url, item.media_type)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
                 </View>
               ) : item.media_type === 'sticker' ? (
                 <View style={{ position: 'relative' }}>
@@ -977,12 +1199,17 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               ) : (
                 <View style={{ position: 'relative' }}>
                   <Image source={{ uri: item.media_url }} style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE }]} resizeMode="cover" />
-                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
+                  <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url, item.media_type)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
                 </View>
               )}
-              <View style={[styles.bubbleFooter, item.media_type === 'sticker' ? { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 } : { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4 }]}>
-                <Text style={[styles.messageTime, { color: item.media_type === 'sticker' ? '#fff' : timeColor }]}>{timeString}</Text>
-                {isMyMessage && statusIcon}
+              <View style={[styles.bubbleFooter, item.media_type === 'sticker' ? { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 } : { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4, justifyContent: 'space-between', width: '100%' }]}>
+                {item.media_type !== 'sticker' && item.content && (item.content.includes('MB') || item.content.includes('KB')) ? (
+                  <Text style={[styles.messageTime, { color: timeColor, fontWeight: 'bold' }]}>{item.content}</Text>
+                ) : <View />}
+                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                  <Text style={[styles.messageTime, { color: item.media_type === 'sticker' ? '#fff' : timeColor }]}>{timeString}</Text>
+                  {isMyMessage && statusIcon}
+                </View>
               </View>
             </View>
           ) : (
@@ -1000,10 +1227,24 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               <Text style={styles.reactionText}>{rList.slice(0, 3).join('')}</Text>
             </TouchableOpacity>
           )}
-        </TouchableOpacity>
-      </SwipeableMessage>
+          </TouchableOpacity>
+        </SwipeableMessage>
+      </View>
     );
-  };
+  }, [
+    userCode,
+    myBubbleColor,
+    theirBubbleColor,
+    highlightedMessageId,
+    showBlueTicks,
+    messages,
+    pendingQueue,
+    replyingTo,
+    SCREEN_WIDTH,
+    IMAGE_SIZE,
+  ]);
+
+  const extraDataKey = renderKey + '|' + showBlueTicks + '|' + highlightedMessageId + '|' + messages.map(m => `${m.id}-${m.read_at}-${JSON.stringify(m.reacoes)}`).join('|');
 
   return (
     <SafeAreaView style={styles.mainContainer}>
@@ -1024,10 +1265,28 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               {showBlueTicks && friendLastSeen ? `${friendCode} • ${formatLastSeen(friendLastSeen)}` : friendCode}
             </Text>
           </View>
+
           <TouchableOpacity onPress={() => setTopMenuVisible(true)} style={styles.menuBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
             <Ionicons name="ellipsis-vertical" size={20} color="#00ff66" />
           </TouchableOpacity>
         </View>
+
+        {pinnedMessage && (
+          <TouchableOpacity onPress={() => handleScrollToMessage(pinnedMessage.id)} style={styles.pinnedBar}>
+            <View style={styles.pinnedBarLeft}>
+              <Ionicons name="pin" size={14} color="#00ff66" style={{ marginRight: 8 }} />
+              <View>
+                <Text style={styles.pinnedLabel}>Mensagem fixada</Text>
+                <Text style={styles.pinnedText} numberOfLines={1}>
+                  {pinnedMessage.media_url ? (pinnedMessage.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : (pinnedMessage.content || '📎 Mídia')}
+                </Text>
+              </View>
+            </View>
+            <TouchableOpacity onPress={handleUnpinMessage} hitSlop={{top: 8, bottom: 8, left: 8, right: 8}}>
+              <Ionicons name="close" size={16} color="#64748B" />
+            </TouchableOpacity>
+          </TouchableOpacity>
+        )}
 
         <ImageBackground 
           source={chatBackground ? { uri: chatBackground } : null} 
@@ -1042,7 +1301,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               data={[...pendingQueue, ...messages]}
               keyExtractor={(item) => String(item.id)}
               renderItem={renderItem}
-              extraData={showBlueTicks}
+              extraData={extraDataKey}
               inverted
               contentContainerStyle={[styles.messagesList, { paddingHorizontal: SCREEN_WIDTH < 360 ? 8 : 12 }]} 
               keyboardShouldPersistTaps="handled"
@@ -1074,7 +1333,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           <View style={styles.replyBarContainer}>
             <View style={styles.replyBarLeft}>
               <Text style={styles.replyUserTarget}>Respondendo</Text>
-              <Text style={styles.replyTextTarget} numberOfLines={1}>{replyingTo.content}</Text>
+              <Text style={styles.replyTextTarget} numberOfLines={1}>
+                {replyingTo.media_url ? (replyingTo.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : replyingTo.content}
+              </Text>
             </View>
             <TouchableOpacity onPress={() => setReplyingTo(null)}><Ionicons name="close-circle" size={20} color="#ef4444" /></TouchableOpacity>
           </View>
@@ -1086,7 +1347,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               <Ionicons name="attach-outline" size={24} color="#64748B" />
             </TouchableOpacity>
             <TextInput style={[styles.textInput, { marginRight: 4 }]} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
-            <TouchableOpacity onPress={() => setGiphyModalVisible(true)} style={[styles.attachBtn, { marginRight: 8 }]} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+            <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={[styles.attachBtn, { marginRight: 8 }]} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="happy-outline" size={26} color="#64748B" />
             </TouchableOpacity>
             <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
@@ -1101,7 +1362,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={22} color="#00ff66" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Foto)</Text></TouchableOpacity>
             <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={22} color="#ef4444" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Vídeo)</Text></TouchableOpacity>
             <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('gallery')}><Ionicons name="images-outline" size={22} color="#3b82f6" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Galeria</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.attachMenuItem} onPress={() => { setAttachMenuVisible(false); setGiphyModalVisible(true); }}><Ionicons name="happy-outline" size={22} color="#f59e0b" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>GIFS</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => { setAttachMenuVisible(false); setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }}><Ionicons name="happy-outline" size={22} color="#f59e0b" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>GIFS</Text></TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>
@@ -1118,7 +1379,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               <TouchableOpacity style={styles.menuItem} onPress={handleRemoveBackground}><Ionicons name="close-circle-outline" size={18} color="#ef4444" style={{ marginRight: 10 }} /><Text style={[styles.menuItemText, { color: '#ef4444' }]}>Remover Fundo</Text></TouchableOpacity>
             )}
             <TouchableOpacity style={styles.menuItem} onPress={() => { setTopMenuVisible(false); setCustomizeModalVisible(true); }}><Ionicons name="color-palette-outline" size={18} color="#00ff66" style={{ marginRight: 10 }} /><Text style={styles.menuItemText}>Personalizar Balões</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.menuItem} onPress={handleClearChat}><Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 10 }} /><Text style={[styles.menuItemText, { color: '#ef4444' }]}>Excluir Bate-papo</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.menuItem} onPress={handleClearChat}><Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 10 }} /><Text style={[styles.menuItemText, { color: '#ef4444' }]}>Limpar Mensagens</Text></TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>
@@ -1174,6 +1435,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             </TouchableOpacity>
             
             <View style={styles.contextualActions}>
+              {reactionTargetMessage && (
+                <TouchableOpacity onPress={() => handlePinMessage(reactionTargetMessage)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={!reactionTargetMessage.media_url ? { marginRight: 20 } : {}}>
+                  <Ionicons name={pinnedMessage?.id === reactionTargetMessage?.id ? "pin" : "pin-outline"} size={24} color="#fff" />
+                </TouchableOpacity>
+              )}
               {reactionTargetMessage && !reactionTargetMessage.media_url && (
                 <TouchableOpacity onPress={async () => {
                   await Clipboard.setStringAsync(reactionTargetMessage.content || '');
@@ -1204,16 +1470,16 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       </Modal>
 
       {/* MODAL 5: Imagem em Tela Cheia */}
-      <Modal animationType="fade" transparent visible={!!fullscreenImage} onRequestClose={() => setFullscreenImage(null)}>
-        <View style={styles.fullscreenOverlay}>
+      {!!fullscreenImage && (
+        <View style={[styles.fullscreenOverlay, { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 9999, elevation: 9999 }]}>
           <TouchableOpacity style={styles.closeFullscreenBtn} onPress={() => setFullscreenImage(null)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
           {fullscreenImage && <Image source={{ uri: fullscreenImage }} style={styles.fullscreenImage} resizeMode="contain" />}
         </View>
-      </Modal>
+      )}
 
       {/* MODAL 7: Video em Tela Cheia */}
-      <Modal animationType="fade" transparent visible={!!fullscreenVideo} onRequestClose={() => setFullscreenVideo(null)}>
-        <View style={styles.fullscreenOverlay}>
+      {!!fullscreenVideo && (
+        <View style={[styles.fullscreenOverlay, { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 9999, elevation: 9999 }]}>
           <TouchableOpacity style={styles.closeFullscreenBtn} onPress={() => setFullscreenVideo(null)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
           {fullscreenVideo && (
             <Video
@@ -1225,7 +1491,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             />
           )}
         </View>
-      </Modal>
+      )}
 
       {/* MODAL 6: Mídias do Chat */}
       <Modal animationType="slide" transparent visible={mediaGalleryVisible} onRequestClose={() => setMediaGalleryVisible(false)}>
@@ -1294,7 +1560,6 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               placeholderTextColor="#64748B"
               value={giphySearch}
               onChangeText={(t) => { setGiphySearch(t); setGiphyTab('search'); }}
-              autoFocus
             />
             <TouchableOpacity onPress={() => setGiphyTab(giphyTab === 'recent' ? 'search' : 'recent')} style={{ backgroundColor: '#111827', padding: 8, borderRadius: 20, borderWidth: 1, borderColor: giphyTab === 'recent' ? '#00ff66' : '#1F2937' }}>
               <Ionicons name={giphyTab === 'recent' ? "search" : "time"} size={22} color={giphyTab === 'recent' ? '#00ff66' : '#64748B'} />
@@ -1433,5 +1698,12 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.3,
     shadowRadius: 3
-  }
+  },
+  pinnedBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#0d1117', paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#1F2937', borderLeftWidth: 3, borderLeftColor: '#00ff66' },
+  pinnedBarLeft: { flexDirection: 'row', alignItems: 'center', flex: 1 },
+  pinnedLabel: { color: '#00ff66', fontSize: 11, fontWeight: 'bold' },
+  pinnedText: { color: '#94a3b8', fontSize: 13, marginTop: 1, maxWidth: 260 },
+  dateSeparator: { flexDirection: 'row', alignItems: 'center', marginVertical: 16, paddingHorizontal: 12 },
+  dateSeparatorLine: { flex: 1, height: 1, backgroundColor: '#1F2937' },
+  dateSeparatorText: { color: '#475569', fontSize: 11, fontWeight: '600', marginHorizontal: 12, textTransform: 'uppercase', backgroundColor: '#050505', paddingHorizontal: 8, letterSpacing: 0.5 }
 });

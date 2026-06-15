@@ -45,6 +45,7 @@ export default function App() {
 
     // Previne capturas de tela e oculta o conteúdo do app no multitarefas (Recentes)
     const secureScreen = async () => {
+      if (Platform.OS === 'web') return; // Evita crash no navegador de PC
       try {
         await ScreenCapture.preventScreenCaptureAsync();
       } catch (e) {
