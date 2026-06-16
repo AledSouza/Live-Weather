@@ -33,6 +33,18 @@ export default function App() {
   const [savedPin, setSavedPin] = useState(null);
   const [failedAttempts, setFailedAttempts] = useState(0);
 
+  // ✅ Extrai o path real do arquivo relativo ao bucket
+  const extractStoragePath = (url) => {
+    try {
+      const marker = '/object/public/chat-media/';
+      const idx = url.indexOf(marker);
+      if (idx === -1) return null;
+      return decodeURIComponent(url.slice(idx + marker.length).split('?')[0]);
+    } catch {
+      return null;
+    }
+  };
+
   // Função que renova o tempo sempre que a tela é tocada
   const resetInactivityTimer = () => {
     if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
@@ -128,11 +140,15 @@ export default function App() {
         msgs.forEach(m => {
           if (m.sender_code !== myCleanCode) uniqueContacts.add(m.sender_code);
           if (m.receiver_code !== myCleanCode) uniqueContacts.add(m.receiver_code);
-          if (m.media_url) filesToDelete.push(m.media_url.split('/').pop());
+          if (m.media_url && !m.media_url.includes('giphy.com')) {
+            const path = extractStoragePath(m.media_url);
+            if (path) filesToDelete.push(path);
+          }
         });
       }
       if (filesToDelete.length > 0) {
-        await supabase.storage.from('chat-media').remove(filesToDelete);
+        const { error: storageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
+        if (storageError) console.error('Erro ao deletar mídias:', storageError);
       }
 
       const { data: myConns } = await supabase.from('conexoes').select('friend_code').eq('user_code', myCleanCode);
@@ -146,7 +162,7 @@ export default function App() {
       await supabase.from('conexoes').update({ friend_name: '####' }).eq('friend_code', myCleanCode);
 
       // Garante que contatos não-salvos também fiquem ofuscados
-      const existingConns = myConns ? myConns.map(c => c.friend_code) : [];
+      const existingConns = myConns ? myConns.map(c => c.friend_code.trim().toLowerCase()) : [];
       const missingConns = Array.from(uniqueContacts).filter(c => !existingConns.includes(c));
       if (missingConns.length > 0) {
         await supabase.from('conexoes').insert(

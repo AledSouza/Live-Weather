@@ -6,6 +6,18 @@ import * as Clipboard from 'expo-clipboard';
 import { supabase } from '../supabase';
 // import { registerForPushNotificationsAsync } from './notificationService';
 
+// ✅ Extrai o path real do arquivo relativo ao bucket
+const extractStoragePath = (url) => {
+  try {
+    const marker = '/object/public/chat-media/';
+    const idx = url.indexOf(marker);
+    if (idx === -1) return null;
+    return decodeURIComponent(url.slice(idx + marker.length).split('?')[0]);
+  } catch {
+    return null;
+  }
+};
+
 export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat }) {
   const [modalVisible, setModalVisible] = useState(false);
   const [editModalVisible, setEditModalVisible] = useState(false);
@@ -67,17 +79,32 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           onPress: async () => {
             setLoading(true);
             try {
-              const myCleanCode = userCode.trim().toLowerCase();
+              const myCode = userCode.trim().toLowerCase();
               
-              // 1. Busca todas as mídias (fotos/vídeos) ligadas a você e deleta do Storage
-              const { data: msgs } = await supabase.from('mensagens').select('media_url').or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
-              if (msgs && msgs.length > 0) {
-                const filesToDelete = msgs.filter(m => m.media_url).map(m => m.media_url.split('/').pop());
-                if (filesToDelete.length > 0) await supabase.storage.from('chat-media').remove(filesToDelete);
+              // ─── 1. Busca apenas mídias que VOCÊ enviou (você tem permissão) ───
+              const { data: sentMsgs } = await supabase
+                .from('mensagens')
+                .select('media_url')
+                .eq('sender_code', myCode);
+
+              if (sentMsgs && sentMsgs.length > 0) {
+                const filesToDelete = sentMsgs
+                  .filter(m => m.media_url && !m.media_url.includes('giphy.com'))
+                  .map(m => extractStoragePath(m.media_url))
+                  .filter(Boolean);
+
+                if (filesToDelete.length > 0) {
+                  const { error: storageErr } = await supabase
+                    .storage
+                    .from('chat-media')
+                    .remove(filesToDelete);
+                  if (storageErr) console.error('Erro ao deletar mídias:', storageErr);
+                }
               }
 
-              // 2. Apaga definitivamente as mensagens do banco de dados (mantém as conexões/canais)
-              await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+              // ─── 2. Apaga mensagens nas duas direções separadamente ───
+              await supabase.from('mensagens').delete().eq('sender_code', myCode);
+              await supabase.from('mensagens').delete().eq('receiver_code', myCode);
 
               alert("Mensagens e mídias limpas com sucesso!");
               fetchMyConversations();
@@ -139,11 +166,15 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         msgs.forEach(m => {
           if (m.sender_code !== myCleanCode) uniqueContacts.add(m.sender_code);
           if (m.receiver_code !== myCleanCode) uniqueContacts.add(m.receiver_code);
-          if (m.media_url) filesToDelete.push(m.media_url.split('/').pop());
+          if (m.media_url && !m.media_url.includes('giphy.com')) {
+            const path = extractStoragePath(m.media_url);
+            if (path) filesToDelete.push(path);
+          }
         });
       }
       if (filesToDelete.length > 0) {
-        await supabase.storage.from('chat-media').remove(filesToDelete);
+        const { error: storageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
+        if (storageError) console.error('Erro ao deletar mídias:', storageError);
       }
 
       const { data: myConns } = await supabase.from('conexoes').select('friend_code').eq('user_code', myCleanCode);
@@ -157,7 +188,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       await supabase.from('conexoes').update({ friend_name: '####' }).eq('friend_code', myCleanCode);
 
       // Garante que contatos não-salvos também fiquem ofuscados
-      const existingConns = myConns ? myConns.map(c => c.friend_code) : [];
+      const existingConns = myConns ? myConns.map(c => c.friend_code.trim().toLowerCase()) : [];
       const missingConns = Array.from(uniqueContacts).filter(c => !existingConns.includes(c));
       if (missingConns.length > 0) {
         await supabase.from('conexoes').insert(
@@ -461,7 +492,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     setTimeout(() => {
       Alert.alert(
         "Excluir Canal",
-        "Tem certeza? Todas as mensagens serão apagadas permanentemente para ambos os terminais.",
+        "Tem certeza? O canal será removido apenas da sua lista (as mensagens são mantidas no servidor e só podem ser apagadas limpando o chat por dentro).",
         [
           { text: "Cancelar", style: "cancel", onPress: () => setChatOptionTarget(null) },
           {
@@ -471,28 +502,16 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               if (!chatOptionTarget) return;
               setAdding(true);
               try {
-                const friendCleanCode = chatOptionTarget.token;
-                const myCleanCode = userCode.trim().toLowerCase();
+                const friendCode = chatOptionTarget.token;
+                const myCode = userCode.trim().toLowerCase();
 
-                // 0. Deleta as mídias associadas a esse canal no Storage (Para limpar espaço real)
-                const { data: msgs } = await supabase.from('mensagens').select('media_url, media_type')
-                  .or(`and(sender_code.eq.${myCleanCode},receiver_code.eq.${friendCleanCode}),and(sender_code.eq.${friendCleanCode},receiver_code.eq.${myCleanCode})`);
-                if (msgs && msgs.length > 0) {
-                  const filesToDelete = msgs.filter(m => m.media_url && m.media_type !== 'sticker').map(m => m.media_url.split('/').pop());
-                  if (filesToDelete.length > 0) await supabase.storage.from('chat-media').remove(filesToDelete);
-                }
+                // ─── Remove a conexão APENAS na sua direção ───
+                const { error: conn1 } = await supabase.from('conexoes').delete().match({ user_code: myCode, friend_code: friendCode });
+                if (conn1) console.error('Erro conexão dir. 1:', conn1);
 
-                // 1. Deleta a conexão nas DUAS direções para garantir a exclusão total
-                await supabase.from('conexoes').delete().match({ user_code: myCleanCode, friend_code: friendCleanCode });
-                await supabase.from('conexoes').delete().match({ user_code: friendCleanCode, friend_code: myCleanCode });
-
-                // 2. Deleta TODAS as mensagens nas DUAS direções (evita bugs do operador OR no banco)
-                await supabase.from('mensagens').delete().match({ sender_code: myCleanCode, receiver_code: friendCleanCode });
-                await supabase.from('mensagens').delete().match({ sender_code: friendCleanCode, receiver_code: myCleanCode });
-
-                // 3. Remove de "Fixados" estritamente (sem fazer toggle reverso)
-                if (pinnedTokens.includes(friendCleanCode)) {
-                  const updatedPins = pinnedTokens.filter(t => t !== friendCleanCode);
+                // ─── 5. Limpa o pin local se existia ───
+                if (pinnedTokens.includes(friendCode)) {
+                  const updatedPins = pinnedTokens.filter(t => t !== friendCode);
                   setPinnedTokens(updatedPins);
                   await AsyncStorage.setItem(`@pinned_${userCode}`, JSON.stringify(updatedPins));
                 }

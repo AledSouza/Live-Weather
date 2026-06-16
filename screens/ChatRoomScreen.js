@@ -28,9 +28,19 @@ const syncTimeWithServer = async () => {
   if (isTimeSynced) return;
   try {
     const start = Date.now();
-    // Pede apenas o cabeçalho do servidor para não consumir banda de download
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/`, { method: 'HEAD' });
-    const dateHeader = res.headers.get('date');
+    
+    // Tentativa 1: HEAD (Rápido, mas pode ser bloqueado por proxies/redes corporativas)
+    let res = await fetch(`${SUPABASE_URL}/rest/v1/`, { method: 'HEAD' }).catch(() => null);
+
+    // Tentativa 2: Fallback seguro com GET caso o HEAD falhe
+    if (!res || !res.headers.get('date')) {
+      res = await fetch(`${SUPABASE_URL}/rest/v1/`, {
+        method: 'GET',
+        headers: { 'apikey': SUPABASE_ANON_KEY }
+      }).catch(() => null);
+    }
+
+    const dateHeader = res?.headers.get('date');
     if (dateHeader) {
       const serverTime = new Date(dateHeader).getTime();
       const latency = (Date.now() - start) / 2; // Desconta o atraso da internet
@@ -40,6 +50,18 @@ const syncTimeWithServer = async () => {
   } catch (e) { console.warn('Falha na sincronização de tempo', e); }
 };
 const getSyncedTime = () => Date.now() + globalTimeOffset;
+
+// ✅ Extrai o path real do arquivo relativo ao bucket
+const extractStoragePath = (url) => {
+  try {
+    const marker = '/object/public/chat-media/';
+    const idx = url.indexOf(marker);
+    if (idx === -1) return null;
+    return decodeURIComponent(url.slice(idx + marker.length).split('?')[0]);
+  } catch {
+    return null;
+  }
+};
 
 const SwipeableMessage = ({ children, onReply }) => {
   const pan = useRef(new Animated.Value(0)).current;
@@ -429,6 +451,62 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               setPendingQueueSynced(prev => prev.map(m => m.id === message.id ? { ...m, status: 'sending' } : m));
             }
 
+            let finalMediaUrl = message.media_url;
+
+            // 🚀 INTEGRAÇÃO: O UPLOAD AGORA É DEFERIDO PARA O QUEUEWORKER (FUNCIONA OFFLINE E COM RETRIES!)
+            if (message.needs_upload) {
+              const ext = message.media_type === 'video' ? 'mp4' : 'jpg';
+              const tempTime = new Date(message.created_at).getTime();
+              // Adiciona um random para evitar conflito de nomes se várias fotos forem upadas no mesmo segundo
+              const filename = `${message.sender_code}-${tempTime}-${Math.floor(Math.random()*1000)}.${ext}`;
+              const mimeType = message.media_type === 'video' ? 'video/mp4' : 'image/jpeg';
+
+              let fileBody;
+              try {
+                const base64 = await FileSystem.readAsStringAsync(message.media_url, { encoding: 'base64' });
+                const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+                const lookup = new Uint8Array(256);
+                for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+
+                let bufferLength = base64.length * 0.75;
+                if (base64[base64.length - 1] === '=') bufferLength--;
+                if (base64[base64.length - 2] === '=') bufferLength--;
+
+                const bytes = new Uint8Array(bufferLength);
+                let p = 0;
+                for (let i = 0; i < base64.length; i += 4) {
+                  const encoded1 = lookup[base64.charCodeAt(i)];
+                  const encoded2 = lookup[base64.charCodeAt(i + 1)];
+                  const encoded3 = lookup[base64.charCodeAt(i + 2)];
+                  const encoded4 = lookup[base64.charCodeAt(i + 3)];
+
+                  bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+                  if (encoded3 !== 64) bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+                  if (encoded4 !== 64) bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+                }
+                fileBody = bytes;
+              } catch (fsErr) {
+                fileBody = new FormData();
+                fileBody.append('file', {
+                  uri: Platform.OS === 'ios' ? message.media_url.replace('file://', '') : message.media_url,
+                  name: filename,
+                  type: mimeType,
+                });
+              }
+
+              const uploadPromise = supabase.storage.from('chat-media').upload(filename, fileBody, {
+                contentType: mimeType,
+                upsert: false
+              });
+              const { error: uploadError } = await uploadPromise;
+              if (uploadError) throw uploadError;
+
+              finalMediaUrl = `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
+              
+              // Remove a flag de upload para que, se a inserção no banco falhar, o app não upe a foto repetida vezes no storage
+              setPendingQueueSynced(prev => prev.map(m => m.id === message.id ? { ...m, media_url: finalMediaUrl, needs_upload: false } : m));
+            }
+
             const payload = {
               sender_code: message.sender_code,
               receiver_code: message.receiver_code,
@@ -436,7 +514,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               reply_to_id: message.reply_to_id,
               created_at: message.created_at
             };
-            if (message.media_url) payload.media_url = message.media_url;
+            if (finalMediaUrl) payload.media_url = finalMediaUrl;
             if (message.media_type) payload.media_type = message.media_type;
 
             const insertPromise = supabase.from('mensagens').insert([payload]).select().single();
@@ -444,7 +522,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             // 🚀 CORREÇÃO DA BOMBA-RELÓGIO: Limpa o timeout para não causar crash silencioso no motor de Tempo Real
             let timeoutId;
             const timeoutPromise = new Promise((_, reject) => {
-              timeoutId = setTimeout(() => reject(new Error('Timeout de rede')), 15000);
+              timeoutId = setTimeout(() => reject(new Error('Timeout de rede')), 30000); // 🚀 Aumentado para 30s (ajuda no 3G/4G ruim)
             });
             
             const res = await Promise.race([insertPromise, timeoutPromise]).catch(err => {
@@ -522,10 +600,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
         const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
 
+        const myCode = userCode.trim().toLowerCase();
+        const frCode = friendCode.trim().toLowerCase();
+
         const { data, error } = await supabase
           .from('mensagens')
           .select('*')
-          .or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`)
+          .or(`and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode})`)
           .order('created_at', { ascending: false });
 
         if (!error) {
@@ -590,10 +671,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
         const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
 
+        const myCode = userCode.trim().toLowerCase();
+        const frCode = friendCode.trim().toLowerCase();
+
         const { data } = await supabase
           .from('mensagens')
           .select('*')
-          .or(`and(sender_code.eq.${userCode},receiver_code.eq.${friendCode}),and(sender_code.eq.${friendCode},receiver_code.eq.${userCode})`)
+          .or(`and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode})`)
           .order('created_at', { ascending: false })
           .limit(30);
         
@@ -698,6 +782,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const handleDeleteMessage = async (messageId) => {
     try {
+      if (infoModalMessage?.media_url && !infoModalMessage.media_url.includes('giphy.com')) {
+        const path = extractStoragePath(infoModalMessage.media_url);
+        if (path) {
+          const { error: storageError } = await supabase.storage.from('chat-media').remove([path]);
+          if (storageError) console.error('Erro ao deletar mídia:', storageError);
+        }
+      }
+
       await supabase.from('mensagens').delete().eq('id', messageId);
       setInfoModalMessage(null);
     } catch (err) { console.error(err); }
@@ -749,9 +841,6 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleUploadAndSendMedia = async (uri, mediaType, fileSize) => {
-    const tempTime = getSyncedTime();
-    const tempId = `temp-${tempTime}`;
-    
     // 🚀 Formata o tamanho do arquivo para MB ou KB
     let sizeStr = '';
     if (fileSize) {
@@ -760,52 +849,26 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
     const finalContent = sizeStr || (mediaType === 'video' ? '📹 Vídeo' : '📷 Foto');
 
-    try {
-      setUploading(true);
-      setMessages((prev) => [{ id: tempId, sender_code: userCode, receiver_code: friendCode, content: sizeStr || 'Enviando...', media_url: uri, media_type: mediaType, created_at: new Date(tempTime).toISOString(), is_uploading: true }, ...prev]);
+    // 🚀 Enfileira a mídia na hora (permitindo envio offline fluido e retries eternos do Upload)
+    let newTime = getSyncedTime();
+    if (newTime <= lastMessageTimeRef.current) newTime = lastMessageTimeRef.current + 1;
+    lastMessageTimeRef.current = newTime;
 
-      const ext = mediaType === 'video' ? 'mp4' : 'jpg';
-      const filename = `${userCode}-${tempTime}.${ext}`;
-      const mimeType = mediaType === 'video' ? 'video/mp4' : 'image/jpeg';
+    const newPendingMessage = {
+      id: `pending-${newTime}-${Math.random()}`,
+      content: finalContent,
+      media_url: uri, // URI Local temporária para visualização imediata na lista
+      media_type: mediaType,
+      sender_code: userCode,
+      receiver_code: friendCode,
+      reply_to_id: replyingTo?.id,
+      created_at: new Date(newTime).toISOString(),
+      status: 'sending',
+      needs_upload: true // 🚀 Informa ao QueueWorker que essa mensagem tem um anexo local e PRECISA de upload
+    };
 
-      const formData = new FormData();
-      formData.append('file', {
-        uri: uri,
-        name: filename,
-        type: mimeType,
-      });
-
-      const { error: uploadError } = await supabase.storage.from('chat-media').upload(filename, formData);
-      if (uploadError) throw uploadError;
-
-      const mediaUrl = `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
-
-      setMessages((prev) => prev.filter(msg => msg.id !== tempId));
-      
-      // 🚀 Envia a mídia respeitando a Fila Inteligente e garantindo Retries offline
-      let newTime = getSyncedTime();
-      if (newTime <= lastMessageTimeRef.current) newTime = lastMessageTimeRef.current + 1;
-      lastMessageTimeRef.current = newTime;
-
-      const newPendingMessage = {
-        id: `pending-${newTime}-${Math.random()}`,
-        content: finalContent,
-        media_url: mediaUrl,
-        media_type: mediaType,
-        sender_code: userCode,
-        receiver_code: friendCode,
-        reply_to_id: replyingTo?.id,
-        created_at: new Date(newTime).toISOString(),
-        status: 'sending'
-      };
-
-      setPendingQueueSynced(prev => [newPendingMessage, ...prev]);
-      sendWeatherNotification(userCode, friendCode);
-      setReplyingTo(null);
-    } catch (err) { 
-      setMessages((prev) => prev.filter(msg => msg.id !== tempId));
-      alert(`Falha no envio. O servidor de mídias pode estar cheio. Considere fazer uma limpeza de armazenamento.\n\nErro: ${err.message}`); 
-    } finally { setUploading(false); }
+    setPendingQueueSynced(prev => [newPendingMessage, ...prev]);
+    setReplyingTo(null);
   };
 
   const handleDownloadMedia = async (url, mediaType = 'image') => {
@@ -850,10 +913,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         uriToSave = downloadRes.uri;
       }
 
-      // 🚀 Cria o Asset na pasta "Pictures" / "Movies" (Google Fotos indexa na hora!)
+      // 🚀 Salva direto na pasta oficial Pictures (O Google Fotos identifica na hora!)
       await MediaLibrary.createAssetAsync(uriToSave);
-      
-      // 🚀 REMOVIDO: FileSystem.deleteAsync. Apagar o arquivo na mão estava causando o bug de sumir da galeria.
       
       if (setPickerActive) setPickerActive(false);
       Alert.alert('Salvo!', 'Mídia salva na galeria com sucesso.');
@@ -880,35 +941,42 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       if (type === 'camera_photo') {
         result = await ImagePicker.launchCameraAsync({ 
           mediaTypes: ImagePicker.MediaTypeOptions.Images, 
-          allowsEditing: false,
+          allowsEditing: true, // 🚀 Permite cortar e editar se tirar foto na hora
           quality: 0.5 // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
         });
       } else if (type === 'camera_video') {
         result = await ImagePicker.launchCameraAsync({ 
           mediaTypes: ImagePicker.MediaTypeOptions.Videos, 
-          allowsEditing: false,
+          allowsEditing: true, // 🚀 Permite aparar o vídeo se gravado na hora
           videoQuality: 0 // 🚀 Grava o vídeo em menor resolução para economizar banco de dados
         });
       } else if (type === 'gallery') {
         result = await ImagePicker.launchImageLibraryAsync({ 
           mediaTypes: ImagePicker.MediaTypeOptions.All, 
-          allowsMultipleSelection: false,
+          allowsMultipleSelection: true, // 🚀 Habilita a seleção múltipla de fotos/vídeos!
+          selectionLimit: 10, // 🚀 Limite seguro para não travar a memória do aparelho
           quality: 0.5, // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
-          videoQuality: 0 // 🚀 Comprime os vídeos da galeria (suportado no iOS)
+          videoQuality: 0, // 🚀 Comprime os vídeos da galeria (suportado no iOS)
+          orderedSelection: true // 🚀 Respeita a ordem exata em que o usuário clicou
         });
       }
 
       if (setPickerActive) setPickerActive(false);
 
-      if (result && !result.canceled && result.assets && result.assets[0].uri) {
-          let finalFileSize = result.assets[0].fileSize;
+      if (result && !result.canceled && result.assets && result.assets.length > 0) {
+        // 🚀 Loop para fazer o upload e enviar todas as fotos selecionadas uma a uma
+        for (const asset of result.assets) {
+          let finalFileSize = asset.fileSize;
           if (!finalFileSize) {
             try {
-              const fileInfo = await FileSystem.getInfoAsync(result.assets[0].uri);
+              const fileInfo = await FileSystem.getInfoAsync(asset.uri);
               finalFileSize = fileInfo.size;
             } catch (e) {}
           }
-          await handleUploadAndSendMedia(result.assets[0].uri, result.assets[0].type || 'image', finalFileSize);
+          // Garante a identificação do tipo, útil para retornos incertos do Android
+          const mediaType = asset.type || (asset.uri.toLowerCase().endsWith('.mp4') ? 'video' : 'image');
+          await handleUploadAndSendMedia(asset.uri, mediaType, finalFileSize);
+        }
       }
     } catch (err) { 
       if (setPickerActive) setPickerActive(false);
@@ -946,18 +1014,58 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             style: "destructive",
             onPress: async () => {
               try {
-                // Extrai o nome dos arquivos (fotos/vídeos) e os apaga do balde de armazenamento
-                const mediaMessages = messages.filter(m => m.media_url && m.media_type !== 'sticker');
-                if (mediaMessages.length > 0) {
-                  const filesToDelete = mediaMessages.map(m => m.media_url.split('/').pop());
-                  await supabase.storage.from('chat-media').remove(filesToDelete);
+                const myCode = userCode.trim().toLowerCase();
+                const frCode = friendCode.trim().toLowerCase();
+
+                // 🚀 Garante que o canal esteja salvo para os dois lados antes de apagar as mensagens.
+                // Isso evita que o chat suma da lista do outro aparelho por falta de mensagens.
+                const { data: existingConns } = await supabase.from('conexoes')
+                  .select('user_code, friend_code')
+                  .or(`and(user_code.eq.${myCode},friend_code.eq.${frCode}),and(user_code.eq.${frCode},friend_code.eq.${myCode})`);
+
+                const hasMyConn = existingConns?.some(c => c.user_code === myCode && c.friend_code === frCode);
+                const hasFrConn = existingConns?.some(c => c.user_code === frCode && c.friend_code === myCode);
+
+                const newConns = [];
+                if (!hasMyConn || !hasFrConn) {
+                  const { data: profiles } = await supabase.from('perfis')
+                    .select('connection_code, nickname')
+                    .in('connection_code', [myCode, frCode]);
+
+                  const myProfile = profiles?.find(p => p.connection_code === myCode);
+                  const frProfile = profiles?.find(p => p.connection_code === frCode);
+
+                  if (!hasMyConn) newConns.push({ user_code: myCode, friend_code: frCode, friend_name: frProfile?.nickname || frCode });
+                  if (!hasFrConn) newConns.push({ user_code: frCode, friend_code: myCode, friend_name: myProfile?.nickname || myCode });
                 }
+
+                if (newConns.length > 0) {
+                  await supabase.from('conexoes').insert(newConns);
+                }
+
+                // 🚀 Busca todas as mídias deste canal direto no servidor antes de apagar
+                const { data: msgs } = await supabase.from('mensagens')
+                  .select('media_url, media_type')
+                  .or(`and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode})`);
                 
+                if (msgs && msgs.length > 0) {
+                  const filesToDelete = msgs
+                    .filter(m => m.media_url && !m.media_url.includes('giphy.com'))
+                    .map(m => extractStoragePath(m.media_url))
+                    .filter(Boolean);
+                    
+                  if (filesToDelete.length > 0) {
+                    const { error: storageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
+                    if (storageError) console.error('Erro ao limpar mídias:', storageError);
+                  }
+                }
+
                 // Deleta definitivamente as mensagens do banco de dados (para os dois usuários)
-                await supabase.from('mensagens').delete().match({ sender_code: userCode, receiver_code: friendCode });
-                await supabase.from('mensagens').delete().match({ sender_code: friendCode, receiver_code: userCode });
+                await supabase.from('mensagens').delete().match({ sender_code: myCode, receiver_code: frCode });
+                await supabase.from('mensagens').delete().match({ sender_code: frCode, receiver_code: myCode });
                 setMessages([]);
                 AsyncStorage.removeItem(`@cache_msgs_${userCode}_${friendCode}`).catch(() => {});
+                alert('Mensagens e mídias apagadas com sucesso.');
               } catch (err) { console.error(err); }
             }
           }
