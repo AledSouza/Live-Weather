@@ -7,7 +7,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
-import { Video, ResizeMode } from 'expo-av';
+import { Audio, Video, ResizeMode } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import * as ScreenCapture from 'expo-screen-capture';
@@ -956,14 +956,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           allowsMultipleSelection: true, // 🚀 Habilita a seleção múltipla de fotos/vídeos!
           selectionLimit: 10, // 🚀 Limite seguro para não travar a memória do aparelho
           quality: 0.5, // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
-          videoQuality: 0, // 🚀 Comprime os vídeos da galeria (suportado no iOS)
           orderedSelection: true // 🚀 Respeita a ordem exata em que o usuário clicou
         });
       }
 
       if (setPickerActive) setPickerActive(false);
 
-      if (result && !result.canceled && result.assets && result.assets.length > 0) {
+      if (result && !result.canceled && result.assets && result.assets.length > 0) { // Apenas para ImagePicker
         // 🚀 Loop para fazer o upload e enviar todas as fotos selecionadas uma a uma
         for (const asset of result.assets) {
           let finalFileSize = asset.fileSize;
