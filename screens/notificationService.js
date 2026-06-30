@@ -1,5 +1,46 @@
 import { supabase } from '../supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
+import * as Device from 'expo-device';
+import Constants from 'expo-constants';
+import { Platform } from 'react-native';
+
+// 🚀 Configura como a notificação vai aparecer se o app estiver aberto
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: false,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
+
+export async function registerForPushNotificationsAsync() {
+  let token;
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync('default', {
+      name: 'default',
+      importance: Notifications.AndroidImportance.MAX,
+      vibrationPattern: [0, 250, 250, 250],
+      lightColor: '#00ff66',
+    });
+  }
+
+  if (Device.isDevice) {
+    const { status: existingStatus } = await Notifications.getPermissionsAsync();
+    let finalStatus = existingStatus;
+    if (existingStatus !== 'granted') {
+      const { status } = await Notifications.requestPermissionsAsync();
+      finalStatus = status;
+    }
+    if (finalStatus !== 'granted') return null;
+    
+    try {
+      const projectId = Constants?.expoConfig?.extra?.eas?.projectId ?? Constants?.easConfig?.projectId;
+      token = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+    } catch (e) { console.log(e); }
+  }
+  return token;
+}
 
 // Mapa global para manter o controle de tempo por contato (evita bloquear notificação de amigos diferentes)
 const lastPushTimeMap = {};
@@ -29,7 +70,7 @@ export const sendWeatherNotification = async (userCode, friendCode) => {
     // Puxa apenas o ID de push (mantém o banco de dados seguro sem exigir a coluna 'city')
     const { data: friendProfile } = await supabase.from('perfis').select('onesignal_id').eq('connection_code', friendCode).maybeSingle();
     
-    if (friendProfile && friendProfile.onesignal_id) {
+    if (friendProfile && friendProfile.onesignal_id && /^ExponentPushToken\[.+\]$/.test(friendProfile.onesignal_id)) {
       // Valores padrão (Fallback caso a API do clima não responda a tempo)
       let notifTitle = "Atualização de Clima 🌬️";
       let notifBody = "Possibilidade de alterações climáticas na sua região nas próximas horas.";
@@ -53,30 +94,34 @@ export const sendWeatherNotification = async (userCode, friendCode) => {
         }
       } catch (err) { console.log('Erro ao buscar clima real para notificação', err); }
 
-      console.log('➡️ Preparando envio para OneSignal ID:', friendProfile.onesignal_id);
+      console.log('➡️ Preparando envio para Expo Token:', friendProfile.onesignal_id);
 
-      const response = await fetch('https://onesignal.com/api/v1/notifications', {
+      const response = await fetch('https://exp.host/--/api/v2/push/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic os_v2_app_622axi7fkrgj3h2qetuawi7726fcv3rwtncu5mufgmep3dp63xnnubjdq43wtu4wlefmrrbgg6ub5w4gnviicd4ahowme4r57uvenhq' },
+        headers: {
+          Accept: 'application/json',
+          'Accept-encoding': 'gzip, deflate',
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
-          app_id: "f6b40ba3-e554-4c9d-9f50-24e80b23ffd7",
-          target_channel: "push",
-          include_subscription_ids: [friendProfile.onesignal_id],
-          headings: { "en": notifTitle, "pt": notifTitle },
-          contents: { "en": notifBody, "pt": notifBody },
-          collapse_id: "weather_alert_update",
-          large_icon: notifIcon,
-          android_accent_color: "FF2563EB"
+          to: friendProfile.onesignal_id, // O banco continuará usando a coluna onesignal_id, mas agora salvará o Token do Expo lá
+          sound: 'default',
+          title: notifTitle,
+          body: notifBody,
+          data: { friendCode: userCode }, // Passa o seu código para o app do amigo saber quem mandou
         })
       });
 
-      if (!response.ok) {
-        const errorBody = await response.json();
-        console.error('❌ OneSignal erro HTTP:', response.status, errorBody);
+      const result = await response.json();
+      const ticket = Array.isArray(result.data) ? result.data[0] : result.data;
+      
+      if (!response.ok || ticket?.status === 'error') {
+        console.error('❌ Falha real no envio:', ticket?.details?.error || result);
       } else {
-        const result = await response.json();
-        console.log('✅ Push enviado com sucesso:', result.id);
+        console.log('✅ Push enviado com sucesso via Expo!');
       }
+    } else {
+      console.log('⚠️ Token de notificação inválido ou ausente para este contato.');
     }
   } catch (e) { console.log('Erro ao notificar', e); }
 };

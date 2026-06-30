@@ -102,6 +102,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const inputTextRef = useRef(''); // 🚀 Captura instantânea do texto para evitar perda de palavras
+  const textInputRef = useRef(null); // 🚀 Controle direto do foco do teclado
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
 
@@ -498,7 +499,18 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 contentType: mimeType,
                 upsert: false
               });
-              const { error: uploadError } = await uploadPromise;
+              
+              // 🚀 FIX: Proteção de Timeout também no Upload para não travar toda a fila de mensagens
+              let uploadTimeoutId;
+              const uploadTimeoutPromise = new Promise((_, reject) => {
+                uploadTimeoutId = setTimeout(() => reject(new Error('Timeout no upload da mídia')), 30000);
+              });
+              
+              const { error: uploadError } = await Promise.race([uploadPromise, uploadTimeoutPromise]).catch(err => {
+                clearTimeout(uploadTimeoutId);
+                throw err;
+              });
+              clearTimeout(uploadTimeoutId);
               if (uploadError) throw uploadError;
 
               finalMediaUrl = `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
@@ -511,8 +523,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               sender_code: message.sender_code,
               receiver_code: message.receiver_code,
               content: message.content,
-              reply_to_id: message.reply_to_id,
-              created_at: message.created_at
+              reply_to_id: message.reply_to_id
             };
             if (finalMediaUrl) payload.media_url = finalMediaUrl;
             if (message.media_type) payload.media_type = message.media_type;
@@ -742,8 +753,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleSendMessage = async () => {
-    const currentText = inputTextRef.current; // 🚀 Lê da referência (garante a última palavra)
-    if (currentText.trim() === '') return;
+    // 🚀 FIX: Força o teclado a confirmar a palavra pendente antes de enviar (bug corretor Android)
+    textInputRef.current?.blur();
+    await new Promise(resolve => setTimeout(resolve, 50)); // dá tempo do onChangeText final chegar
+
+    const currentText = inputTextRef.current; // Lê da referência agora atualizada com a palavra final
+    if (currentText.trim() === '') {
+      textInputRef.current?.focus(); // Devolve o foco se tentou enviar vazio
+      return;
+    }
     
     const messageContent = currentText.trim();
     const currentReplyId = replyingTo ? replyingTo.id : null;
@@ -774,6 +792,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     };
 
     setPendingQueueSynced(prev => [newPendingMessage, ...prev]);
+
+    textInputRef.current?.focus(); // Mantém o teclado aberto para continuar conversando
   };
 
   const forceManualRetry = (msgId) => {
@@ -1453,7 +1473,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <TouchableOpacity onPress={() => setAttachMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="attach-outline" size={24} color="#64748B" />
             </TouchableOpacity>
-            <TextInput style={[styles.textInput, { marginRight: 4 }]} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
+            <TextInput ref={textInputRef} style={[styles.textInput, { marginRight: 4 }]} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
             <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={[styles.attachBtn, { marginRight: 8 }]} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="happy-outline" size={26} color="#64748B" />
             </TouchableOpacity>

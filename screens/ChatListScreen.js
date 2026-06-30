@@ -4,7 +4,7 @@ import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
 import { supabase } from '../supabase';
-// import { registerForPushNotificationsAsync } from './notificationService';
+import { registerForPushNotificationsAsync } from './notificationService';
 
 // ✅ Extrai o path real do arquivo relativo ao bucket
 const extractStoragePath = (url) => {
@@ -225,10 +225,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     await AsyncStorage.setItem('@notifications_enabled', newState ? 'true' : 'false');
     if (newState) {
       try {
-        // const token = await registerForPushNotificationsAsync();
-        // if (token && userCode) {
-        //   // await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', userCode.trim().toLowerCase());
-        // }
+        const token = await registerForPushNotificationsAsync();
+        if (token && /^ExponentPushToken\[.+\]$/.test(token) && userCode) {
+          await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', userCode.trim().toLowerCase());
+        }
       } catch (e) {}
       alert('Notificações de Clima ATIVADAS.');
     } else {

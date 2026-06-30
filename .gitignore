@@ -18,6 +18,9 @@ expo-env.d.ts
 *.key
 *.mobileprovision
 
+# Firebase Service Account Keys
+*firebase-adminsdk*.json
+
 # Metro
 .metro-health-check*
 

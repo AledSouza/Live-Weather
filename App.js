@@ -5,7 +5,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ScreenCapture from 'expo-screen-capture';
 import { supabase } from './supabase';
 import { Ionicons } from '@expo/vector-icons';
-// import { registerForPushNotificationsAsync } from './screens/notificationService';
+import { registerForPushNotificationsAsync } from './screens/notificationService';
 
 // Telas do ecossistema
 import WeatherScreen from './screens/WeatherScreen';
@@ -101,11 +101,11 @@ export default function App() {
           try {
             const isEnabled = await AsyncStorage.getItem('@notifications_enabled');
             if (isEnabled !== 'false') {
-              // const token = await registerForPushNotificationsAsync();
-              // if (token) {
-              //   // Mantém o nome onesignal_id no banco para não quebrar o app em produção
-              //   await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', cleanCode);
-              // }
+              const token = await registerForPushNotificationsAsync();
+              if (token && /^ExponentPushToken\[.+\]$/.test(token)) {
+                // Mantém o nome onesignal_id no banco para não precisar alterar a tabela agora
+                await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', cleanCode);
+              }
             }
           } catch (e) { console.warn('Erro ao atualizar Token na inicialização', e); }
         }
@@ -245,16 +245,16 @@ export default function App() {
       const part2 = Math.random().toString(36).substr(2, 4);
       const generatedCode = `${part1}-${part2}`.toLowerCase();
 
-      // let token = null;
-      // try {
-      //   token = await registerForPushNotificationsAsync();
-      // } catch (err) {
-      //   console.warn('Erro ao obter Token de Push:', err);
-      // }
+      let token = null;
+      try {
+        token = await registerForPushNotificationsAsync();
+      } catch (err) {
+        console.warn('Erro ao obter Token de Push:', err);
+      }
 
-      // Mantém o nome onesignal_id no banco para não quebrar o app em produção
       const novoPerfil = { nickname: nickname.trim(), connection_code: generatedCode };
-      // if (token) novoPerfil.onesignal_id = token;
+      // Salvamos o Token do Expo na mesma coluna que já existe para não quebrar o banco
+      if (token && /^ExponentPushToken\[.+\]$/.test(token)) novoPerfil.onesignal_id = token;
 
       const { error } = await supabase
         .from('perfis')
