@@ -128,6 +128,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [renderKey, setRenderKey] = useState(0);
   const [pinnedMessage, setPinnedMessage] = useState(null);
 
+  // 🚀 ESTADOS DE SUGESTÃO DE STICKER (Como no WhatsApp/Telegram)
+  const [emojiSuggestions, setEmojiSuggestions] = useState([]);
+  const [showEmojiSuggestions, setShowEmojiSuggestions] = useState(false);
+  const emojiSuggestionTimeout = useRef(null);
+
+  // 🚀 ESTADOS DO NOVO MODAL DE AÇÃO DE STICKER (Estilo WhatsApp)
+  const [stickerActionModalVisible, setStickerActionModalVisible] = useState(false);
+  const [selectedSticker, setSelectedSticker] = useState(null); // { url: string, isFavorite: boolean, message: object }
+
   const roomKey = [userCode.trim().toLowerCase(), friendCode.trim().toLowerCase()].sort().join('-');
 
   // 🚀 LÓGICA DE EXCEÇÃO DE PRIVACIDADE: Libera o print/gravação de tela APENAS ao ver mídias em tela cheia
@@ -253,10 +262,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [giphySearch, setGiphySearch] = useState('');
   const [giphyResults, setGiphyResults] = useState([]);
   const [isSearchingGiphy, setIsSearchingGiphy] = useState(false);
+  const [isFetchingMoreGiphy, setIsFetchingMoreGiphy] = useState(false);
+  const [giphyOffset, setGiphyOffset] = useState(0);
   const [giphyError, setGiphyError] = useState(null);
   const [recentGifs, setRecentGifs] = useState([]);
-  const [giphyTab, setGiphyTab] = useState('recent'); // 'search' ou 'recent'
+  const [favoriteGifs, setFavoriteGifs] = useState([]); // 🚀 NOVO: Favoritos
+  const [giphyTab, setGiphyTab] = useState('recent'); // 'search', 'recent' ou 'favorites'
   const GIPHY_API_KEY = 'u9JYVOpH3aNfJmB3qJWc5E42ln1kiwr9'; // Chave pessoal da API Giphy
+  const GIPHY_PAGE_LIMIT = 24;
 
   // 🚀 ESTADOS DE PERSONALIZAÇÃO (CORES RGB)
   const [chatBackground, setChatBackground] = useState(null);
@@ -348,6 +361,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
         const savedGifs = await AsyncStorage.getItem('@recent_gifs');
         if (savedGifs) setRecentGifs(JSON.parse(savedGifs));
+
+        const savedFavs = await AsyncStorage.getItem('@favorite_gifs'); // 🚀 Carrega favoritos
+        if (savedFavs) setFavoriteGifs(JSON.parse(savedFavs));
       } catch (e) { console.error(e); }
     };
     initializeChatState();
@@ -360,46 +376,80 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   // 🚀 Lógica de Busca de Stickers (Giphy)
   useEffect(() => {
+    // Quando a busca muda, reseta os resultados e a paginação (Giphy)
+    setGiphyResults([]);
+    setGiphyOffset(0);
+  }, [giphySearch]);
+
+  useEffect(() => {
+    const searchTerm = giphySearch.trim();
+
     const delayDebounce = setTimeout(() => {
-      if (!giphyModalVisible) return;
+      if (!giphyModalVisible || giphyTab !== 'search') return;
+
+      // 🚀 OTIMIZAÇÃO: Só busca se o termo tiver 3+ caracteres ou se estiver vazio (para trending)
+      if (searchTerm.length > 0 && searchTerm.length < 3) {
+        setGiphyResults([]); // Limpa resultados para buscas curtas
+        setGiphyError(null);
+        return;
+      }
+
+      // 🚀 OTIMIZAÇÃO 2: Não busca "trending" de novo se já tiver resultados na tela.
+      // Isso evita requisições desnecessárias ao reabrir o modal ou trocar de abas.
+      if (searchTerm.length === 0 && giphyResults.length > 0) {
+        return;
+      }
+
       setIsSearchingGiphy(true);
-      setGiphyError(null); // Limpa os erros anteriores ao buscar de novo
-
-      const endpoint = giphySearch.trim().length > 0
-        ? `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(giphySearch)}&limit=24&rating=pg`
-        : `https://api.giphy.com/v1/gifs/trending?api_key=${GIPHY_API_KEY}&limit=24&rating=pg`;
-
-      fetch(endpoint)
-        .then(res => res.json())
-        .then(data => {
-          console.log('GIPHY RESPONSE:', JSON.stringify(data));
-          if (data.meta && data.meta.status !== 200) {
-            console.warn('GIPHY ERROR:', data.meta.msg);
-            setGiphyError(`API: ${data.meta.msg} (Status: ${data.meta.status})`);
-          }
-          setGiphyResults(data.data || []);
-        })
-        .catch(err => {
-          console.error('Giphy fetch error:', err);
-          setGiphyError(`Erro de Conexão: ${err.message}`);
-          setGiphyResults([]);
-        })
-        .finally(() => setIsSearchingGiphy(false));
-    }, 500);
+      fetchGiphy(true); // `true` para indicar que é uma nova busca (reset)
+    }, 800); // 🚀 Aumentado o debounce para 800ms para economizar requisições
 
     return () => clearTimeout(delayDebounce);
-  }, [giphySearch, giphyModalVisible]);
+  }, [giphySearch, giphyModalVisible, giphyTab]);
+
+  const fetchGiphy = (isNewSearch = false) => {
+    if (isFetchingMoreGiphy) return;
+    if (isNewSearch) {
+      setIsSearchingGiphy(true);
+    } else {
+      setIsFetchingMoreGiphy(true);
+    }
+    setGiphyError(null);
+
+    const currentOffset = isNewSearch ? 0 : giphyOffset;
+    const endpoint = giphySearch.trim().length > 0
+      ? `https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(giphySearch)}&limit=${GIPHY_PAGE_LIMIT}&offset=${currentOffset}&rating=pg`
+      : `https://api.giphy.com/v1/gifs/trending?api_key=${GIPHY_API_KEY}&limit=${GIPHY_PAGE_LIMIT}&offset=${currentOffset}&rating=pg`;
+
+    fetch(endpoint)
+      .then(res => res.json())
+      .then(data => {
+        if (data.meta && data.meta.status !== 200) {
+          setGiphyError(`API: ${data.meta.msg} (Status: ${data.meta.status})`);
+        }
+        const newResults = data.data || [];
+        setGiphyResults(prev => isNewSearch ? newResults : [...prev, ...newResults]);
+        setGiphyOffset(currentOffset + GIPHY_PAGE_LIMIT);
+      })
+      .catch(err => {
+        setGiphyError(`Erro de Conexão: ${err.message}`);
+        if (isNewSearch) setGiphyResults([]);
+      })
+      .finally(() => {
+        setIsSearchingGiphy(false);
+        setIsFetchingMoreGiphy(false);
+      });
+  };
 
   const handleSendSticker = async (stickerUrl) => {
     setGiphyModalVisible(false);
     
-    // 🚀 Salva a figurinha nos Recentes (Máximo de 15)
+    // 🚀 Salva a figurinha nos Recentes (sem limite)
     setRecentGifs(prev => {
-      const updated = [stickerUrl, ...prev.filter(g => g !== stickerUrl)].slice(0, 15);
+      const updated = [stickerUrl, ...prev.filter(g => g !== stickerUrl)];
       AsyncStorage.setItem('@recent_gifs', JSON.stringify(updated)).catch(() => {});
       return updated;
     });
-
 
     // 🚀 USA A FILA INTELIGENTE (Garante entrega instantânea e offline na sua tela)
     let newTime = getSyncedTime();
@@ -420,6 +470,54 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
     setPendingQueueSynced(prev => [newPendingMessage, ...prev]);
     setReplyingTo(null);
+  };
+
+  // 🚀 NOVO: Lógica para favoritar/desfavoritar GIFs com toque longo
+  const handleToggleFavoriteGif = async (stickerUrl, showAlert = true) => {
+    const isFavorited = favoriteGifs.includes(stickerUrl);
+    let updated;
+    if (isFavorited) {
+      updated = favoriteGifs.filter(g => g !== stickerUrl);
+      if (showAlert) alert('Removido dos Favoritos!');
+    } else {
+      updated = [stickerUrl, ...favoriteGifs];
+      if (showAlert) alert('Adicionado aos Favoritos!');
+    }
+    setFavoriteGifs(updated);
+    await AsyncStorage.setItem('@favorite_gifs', JSON.stringify(updated));
+  };
+
+  // 🚀 NOVO: Abre o modal de ação ao clicar em um sticker
+  const handleStickerPress = (stickerUrl, messageItem) => {
+    const isFavorite = favoriteGifs.includes(stickerUrl);
+    setSelectedSticker({ url: stickerUrl, isFavorite, message: messageItem });
+    setStickerActionModalVisible(true);
+  };
+
+  const fetchEmojiSuggestions = (text) => {
+    const emojiRegex = /[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]/gu;
+    const emojis = text.match(emojiRegex);
+
+    if (!emojis || text.replace(emojiRegex, '').trim().length > 0) {
+      setShowEmojiSuggestions(false);
+      setEmojiSuggestions([]);
+      return;
+    }
+
+    setShowEmojiSuggestions(true);
+
+    // Mapeamento simples de emoji para termo de busca
+    const emojiMap = { '😂': 'laughing', '👍': 'thumbs up', '❤️': 'heart', '😢': 'crying', '🙏': 'praying', '🎉': 'party', '😊': 'smile', '🤔': 'thinking', '🤯': 'mind blown', '🔥': 'fire' };
+    const lastEmoji = emojis[emojis.length - 1];
+    const searchTerm = emojiMap[lastEmoji] || lastEmoji;
+
+    if (emojiSuggestionTimeout.current) clearTimeout(emojiSuggestionTimeout.current);
+    emojiSuggestionTimeout.current = setTimeout(() => {
+      fetch(`https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(searchTerm)}&limit=10&rating=pg`)
+        .then(res => res.json())
+        .then(data => setEmojiSuggestions(data.data || []))
+        .catch(() => setEmojiSuggestions([]));
+    }, 300);
   };
 
   useEffect(() => {
@@ -747,9 +845,12 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const handleTextChange = (text) => {
     inputTextRef.current = text; // 🚀 Salva imediatamente na memória absoluta
     setInputText(text);
-    
+
     // 🚀 Removemos o 'await' para não engasgar o teclado ao digitar rápido
     AsyncStorage.setItem(`@draft_${userCode}_${friendCode}`, text).catch(() => {});
+
+    // 🚀 NOVO: Chama a busca por sugestões de emoji
+    fetchEmojiSuggestions(text);
   };
 
   const handleSendMessage = async () => {
@@ -767,6 +868,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const currentReplyId = replyingTo ? replyingTo.id : null;
     
     inputTextRef.current = '';
+    setShowEmojiSuggestions(false); // Esconde sugestões ao enviar
     setInputText('');
     setReplyingTo(null);
 
@@ -1281,8 +1383,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             if (!hasTriggeredShort.current && !hasTriggeredLong.current) {
               if (item.status === 'failed') {
                 forceManualRetry(item.id);
-              } else if (item.media_url) {
-                if (item.media_type === 'video') {
+              } else if (item.media_url) { // 🚀 Lógica de clique em Mídia
+                if (item.media_type === 'sticker') {
+                  handleStickerPress(item.media_url, item); // Abre o modal de ações para a figurinha
+                } else if (item.media_type === 'video') {
                   setFullscreenVideo(item.media_url);
                 } else {
                   setFullscreenImage(item.media_url);
@@ -1369,6 +1473,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     replyingTo,
     SCREEN_WIDTH,
     IMAGE_SIZE,
+    favoriteGifs,
   ]);
 
   const extraDataKey = renderKey + '|' + showBlueTicks + '|' + highlightedMessageId + '|' + messages.map(m => `${m.id}-${m.read_at}-${JSON.stringify(m.reacoes)}`).join('|');
@@ -1455,6 +1560,28 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             </TouchableOpacity>
           )}
         </ImageBackground>
+
+        {/* 🚀 NOVO: Janela de Sugestão de Stickers por Emoji */}
+        {showEmojiSuggestions && (
+          <View style={styles.suggestionContainer}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 10 }}>
+              {emojiSuggestions.map(gif => (
+                <TouchableOpacity
+                  key={gif.id}
+                  style={styles.suggestionItem}
+                  onPress={() => {
+                    handleSendSticker(`https://media2.giphy.com/media/${gif.id}/200.gif`);
+                    setShowEmojiSuggestions(false);
+                    setInputText('');
+                    inputTextRef.current = '';
+                  }}
+                >
+                  <Image source={{ uri: gif.images.fixed_width.url }} style={styles.suggestionImage} />
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+          </View>
+        )}
 
         {replyingTo && (
           <View style={styles.replyBarContainer}>
@@ -1686,52 +1813,151 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               placeholder="Pesquisar stickers..." 
               placeholderTextColor="#64748B"
               value={giphySearch}
-              onChangeText={(t) => { setGiphySearch(t); setGiphyTab('search'); }}
+              onChangeText={(t) => { setGiphySearch(t); if (giphyTab !== 'search') setGiphyTab('search'); }}
+              onFocus={() => setGiphyTab('search')}
             />
-            <TouchableOpacity onPress={() => setGiphyTab(giphyTab === 'recent' ? 'search' : 'recent')} style={{ backgroundColor: '#111827', padding: 8, borderRadius: 20, borderWidth: 1, borderColor: giphyTab === 'recent' ? '#00ff66' : '#1F2937' }}>
-              <Ionicons name={giphyTab === 'recent' ? "search" : "time"} size={22} color={giphyTab === 'recent' ? '#00ff66' : '#64748B'} />
-            </TouchableOpacity>
+            <View style={styles.giphyTabContainer}>
+              <TouchableOpacity onPress={() => setGiphyTab('recent')} style={[styles.giphyTab, giphyTab === 'recent' && styles.giphyTabActive]}>
+                <Ionicons name="time-outline" size={20} color={giphyTab === 'recent' ? '#00ff66' : '#64748B'} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setGiphyTab('favorites')} style={[styles.giphyTab, giphyTab === 'favorites' && styles.giphyTabActive]}>
+                <Ionicons name="star-outline" size={20} color={giphyTab === 'favorites' ? '#00ff66' : '#64748B'} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setGiphyTab('search')} style={[styles.giphyTab, giphyTab === 'search' && styles.giphyTabActive]}>
+                <Ionicons name="search-outline" size={20} color={giphyTab === 'search' ? '#00ff66' : '#64748B'} />
+              </TouchableOpacity>
+            </View>
           </View>
 
           {giphyTab === 'recent' ? (
             <FlatList 
               data={recentGifs} 
-              keyExtractor={(item, index) => `recent-${index}`} 
+              keyExtractor={(item, index) => `recent-${item}-${index}`} 
               numColumns={3} 
               contentContainerStyle={{ padding: 4 }}
               renderItem={({ item }) => (
-                <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} onPress={() => handleSendSticker(item)}>
+                <TouchableOpacity 
+                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                  onPress={() => handleSendSticker(item)}
+                  onLongPress={() => handleToggleFavoriteGif(item)}
+                  delayLongPress={800}
+                >
                   <Image source={{ uri: item }} style={{ width: '100%', height: '100%' }} resizeMode="contain" />
                 </TouchableOpacity>
               )}
               ListEmptyComponent={() => (
-                <View style={{ flex: 1, alignItems: 'center', marginTop: 50, paddingHorizontal: 20 }}><Text style={{ color: '#475569', textAlign: 'center' }}>Nenhum GIF recente salvo.</Text></View>
+                <View style={{ flex: 1, alignItems: 'center', marginTop: 50, paddingHorizontal: 20 }}><Text style={{ color: '#475569', textAlign: 'center' }}>Nenhuma figurinha recente.</Text></View>
               )}
             />
-          ) : (
-            isSearchingGiphy ? (
+          ) : giphyTab === 'favorites' ? (
+            <FlatList 
+              data={favoriteGifs} 
+              keyExtractor={(item, index) => `favorite-${item}-${index}`} 
+              numColumns={3} 
+              contentContainerStyle={{ padding: 4 }}
+              renderItem={({ item }) => (
+                <TouchableOpacity 
+                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                  onPress={() => handleSendSticker(item)}
+                  onLongPress={() => handleToggleFavoriteGif(item)}
+                  delayLongPress={800}
+                >
+                  <Image source={{ uri: item }} style={{ width: '100%', height: '100%' }} resizeMode="contain" />
+                  <View style={{ position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 10, padding: 2 }}>
+                    <Ionicons name="star" size={12} color="#facc15" />
+                  </View>
+                </TouchableOpacity>
+              )}
+              ListEmptyComponent={() => (
+                <View style={{ flex: 1, alignItems: 'center', marginTop: 50, paddingHorizontal: 20 }}><Text style={{ color: '#475569', textAlign: 'center' }}>Nenhuma figurinha favorita.{'\n'}Segure uma figurinha para favoritar.</Text></View>
+              )}
+            />
+          ) : isSearchingGiphy ? (
               <ActivityIndicator size="large" color="#00ff66" style={{ flex: 1, marginTop: 50 }} />
             ) : (
               <FlatList 
                 data={giphyResults} 
-                keyExtractor={(item) => String(item.id)} 
+                keyExtractor={(item, index) => `${item.id}-${index}`} 
                 numColumns={3} 
                 contentContainerStyle={{ padding: 4 }}
+                onEndReached={() => fetchGiphy(false)}
+                onEndReachedThreshold={0.5}
                 renderItem={({ item }) => (
-                  <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} onPress={() => handleSendSticker(`https://media2.giphy.com/media/${item.id}/200.gif`)}>
+                  <TouchableOpacity 
+                    style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                    onPress={() => handleSendSticker(`https://media2.giphy.com/media/${item.id}/200.gif`)}
+                    onLongPress={() => handleToggleFavoriteGif(`https://media2.giphy.com/media/${item.id}/200.gif`)}
+                    delayLongPress={800}
+                  >
                     <Image source={{ uri: item.images.fixed_height.url }} style={{ width: '100%', height: '100%' }} resizeMode="contain" />
                   </TouchableOpacity>
                 )}
+                ListFooterComponent={isFetchingMoreGiphy && <ActivityIndicator size="small" color="#00ff66" style={{ marginVertical: 20 }} />}
                 ListEmptyComponent={() => (
-                  <View style={{ flex: 1, alignItems: 'center', marginTop: 50, paddingHorizontal: 20 }}><Text style={{ color: giphyError ? '#ef4444' : '#475569', textAlign: 'center' }}>{giphyError ? `Falha no Giphy:\n${giphyError}` : 'Nenhum sticker encontrado.'}</Text></View>
+                  (() => {
+                    const searchTerm = giphySearch.trim();
+                    if (giphyError) {
+                      return (
+                        <View style={styles.giphyEmptyState}>
+                          <Ionicons name="cloud-offline-outline" size={48} color="#ef4444" />
+                          <Text style={styles.giphyEmptyTitle}>Falha na Conexão</Text>
+                          <Text style={styles.giphyEmptySubtitleError}>Não foi possível conectar ao Giphy. Verifique sua internet e tente novamente.</Text>
+                          <Text style={styles.giphyEmptyDetails}>{`Detalhes: ${giphyError}`}</Text>
+                        </View>
+                      );
+                    }
+                    if (searchTerm.length > 0 && searchTerm.length < 3) {
+                      return (
+                        <View style={styles.giphyEmptyState}>
+                          <Ionicons name="text-outline" size={48} color="#475569" />
+                          <Text style={styles.giphyEmptyTitle}>Continue digitando...</Text>
+                          <Text style={styles.giphyEmptySubtitle}>Digite pelo menos 3 caracteres para buscar no Giphy.</Text>
+                        </View>
+                      );
+                    }
+                    if (searchTerm.length >= 3) {
+                      return (
+                        <View style={styles.giphyEmptyState}>
+                          <Ionicons name="search-outline" size={48} color="#475569" /> 
+                          <Text style={styles.giphyEmptyTitle}>Nenhum resultado</Text>
+                          <Text style={styles.giphyEmptySubtitle}>Não encontramos figurinhas para "{searchTerm}".</Text>
+                        </View>
+                      );
+                    }
+                    // Estado inicial ou de trending sem resultados
+                    return null;
+                  })()
                 )}
               />
             )
-          )}
+          }
         </SafeAreaView>
       </Modal>
+
+      {/* MODAL 10: Ações do Sticker (Estilo WhatsApp) */}
+      <Modal animationType="fade" transparent visible={stickerActionModalVisible} onRequestClose={() => setStickerActionModalVisible(false)}> 
+        <TouchableOpacity style={styles.modalOverlayDark} activeOpacity={1} onPress={() => setStickerActionModalVisible(false)}>
+          <TouchableOpacity activeOpacity={1} style={styles.stickerActionCard}>
+            {selectedSticker?.url && (
+              <Image source={{ uri: selectedSticker.url }} style={styles.stickerPreview} resizeMode="contain" />
+            )}
+            <View style={styles.stickerActionButtons}>
+              <TouchableOpacity style={styles.stickerActionBtn} onPress={() => {
+                handleToggleFavoriteGif(selectedSticker.url, false);
+                // Atualiza o estado local para refletir a mudança sem fechar o modal
+                setSelectedSticker(prev => ({ ...prev, isFavorite: !prev.isFavorite }));
+              }}>
+                <Text style={styles.stickerActionText}>{selectedSticker?.isFavorite ? 'Remover dos Favoritos' : 'Adicionar aos Favoritos'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.stickerActionBtn, { borderBottomWidth: 0 }]} onPress={() => setStickerActionModalVisible(false)}>
+                <Text style={[styles.stickerActionText, { color: '#ef4444', fontWeight: 'bold' }]}>Cancelar</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
-  );
+  ); 
 }
 
 const styles = StyleSheet.create({
@@ -1832,5 +2058,21 @@ const styles = StyleSheet.create({
   pinnedText: { color: '#94a3b8', fontSize: 13, marginTop: 1, maxWidth: 260 },
   dateSeparator: { flexDirection: 'row', alignItems: 'center', marginVertical: 16, paddingHorizontal: 12 },
   dateSeparatorLine: { flex: 1, height: 1, backgroundColor: '#1F2937' },
-  dateSeparatorText: { color: '#475569', fontSize: 11, fontWeight: '600', marginHorizontal: 12, textTransform: 'uppercase', backgroundColor: '#050505', paddingHorizontal: 8, letterSpacing: 0.5 }
+  dateSeparatorText: { color: '#475569', fontSize: 11, fontWeight: '600', marginHorizontal: 12, textTransform: 'uppercase', backgroundColor: '#050505', paddingHorizontal: 8, letterSpacing: 0.5 },
+  giphyTabContainer: { flexDirection: 'row', backgroundColor: '#111827', borderRadius: 20, padding: 2, marginLeft: 8 },
+  giphyTab: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 18 },
+  giphyTabActive: { backgroundColor: '#1F2937' },
+  suggestionContainer: { height: 90, backgroundColor: '#0d0d0d', borderTopWidth: 1, borderTopColor: '#1F2937' },
+  suggestionItem: { width: 70, height: 70, margin: 5, borderRadius: 8, overflow: 'hidden', backgroundColor: '#1e293b' },
+  suggestionImage: { width: '100%', height: '100%' },
+  stickerActionCard: { backgroundColor: '#0d0d0d', borderRadius: 20, padding: 15, borderWidth: 1, borderColor: '#1F2937', width: '90%', maxWidth: 320, alignItems: 'center' },
+  stickerPreview: { width: 200, height: 200, marginBottom: 15 },
+  stickerActionButtons: { width: '100%' },
+  stickerActionBtn: { paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: '#1F2937' },
+  stickerActionText: { color: '#fff', fontSize: 16, textAlign: 'center' },
+  giphyEmptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', marginTop: 80, paddingHorizontal: 20 },
+  giphyEmptyTitle: { color: '#cbd5e1', fontSize: 18, fontWeight: 'bold', marginTop: 15, textAlign: 'center' },
+  giphyEmptySubtitle: { color: '#64748B', marginTop: 5, textAlign: 'center', fontSize: 14 },
+  giphyEmptySubtitleError: { color: '#9ca3af', marginTop: 5, textAlign: 'center', fontSize: 14 },
+  giphyEmptyDetails: { color: '#ef4444', marginTop: 10, textAlign: 'center', fontSize: 11, fontFamily: 'monospace' },
 });
