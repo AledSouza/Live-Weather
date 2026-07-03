@@ -2,7 +2,7 @@
   "expo": {
     "name": "Live Weather",
     "slug": "snack-30daa59e-3096-4c16-b6a6-391d610664cd",
-    "version": "2.7.1",
+    "version": "2.7.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

@@ -285,7 +285,13 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         
         const lastMsg = chatMsgs[0];
         let prefix = lastMsg.sender_code.trim().toLowerCase() === myCleanCode ? 'Você: ' : '';
-        if (lastMsg.media_url) return prefix + (lastMsg.media_type === 'video' ? '📹 Vídeo' : '📷 Foto');
+        if (lastMsg.media_url) {
+          if (lastMsg.media_type?.includes('_spoiler')) return prefix + '🤫 Mídia com Spoiler';
+          if (lastMsg.media_type === 'video') return prefix + '📹 Vídeo';
+          if (lastMsg.media_type === 'document') return prefix + '📄 Documento';
+          if (lastMsg.media_type === 'sticker') return prefix + '🎉 Sticker';
+          return prefix + '📷 Foto';
+        }
         return prefix + lastMsg.content;
       };
 

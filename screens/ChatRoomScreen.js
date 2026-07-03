@@ -12,6 +12,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import * as ScreenCapture from 'expo-screen-capture';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as DocumentPicker from 'expo-document-picker';
+import * as Sharing from 'expo-sharing';
 import * as Clipboard from 'expo-clipboard';
 // import * as Notifications from 'expo-notifications';
 import { supabase } from '../supabase';
@@ -61,6 +63,23 @@ const extractStoragePath = (url) => {
   } catch {
     return null;
   }
+};
+
+// 🚀 Mapeia a extensão do arquivo para um ícone específico
+const getDocumentIcon = (content) => {
+  const filename = (content || '|').split('|')[0].toLowerCase();
+  const ext = filename.split('.').pop();
+
+  if (['mp3', 'wav', 'm4a', 'ogg', 'aac'].includes(ext)) {
+    return 'musical-notes-outline';
+  }
+  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) {
+    return 'archive-outline';
+  }
+  if (ext === 'pdf') {
+    return 'book-outline';
+  }
+  return 'document-text-outline';
 };
 
 const SwipeableMessage = ({ children, onReply }) => {
@@ -128,6 +147,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [renderKey, setRenderKey] = useState(0);
   const [pinnedMessage, setPinnedMessage] = useState(null);
 
+  const [revealedSpoilers, setRevealedSpoilers] = useState(new Set());
   // 🚀 ESTADOS DE SUGESTÃO DE STICKER (Como no WhatsApp/Telegram)
   const [emojiSuggestions, setEmojiSuggestions] = useState([]);
   const [showEmojiSuggestions, setShowEmojiSuggestions] = useState(false);
@@ -554,11 +574,20 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
             // 🚀 INTEGRAÇÃO: O UPLOAD AGORA É DEFERIDO PARA O QUEUEWORKER (FUNCIONA OFFLINE E COM RETRIES!)
             if (message.needs_upload) {
-              const ext = message.media_type === 'video' ? 'mp4' : 'jpg';
+              let ext, mimeType, filename;
               const tempTime = new Date(message.created_at).getTime();
-              // Adiciona um random para evitar conflito de nomes se várias fotos forem upadas no mesmo segundo
-              const filename = `${message.sender_code}-${tempTime}-${Math.floor(Math.random()*1000)}.${ext}`;
-              const mimeType = message.media_type === 'video' ? 'video/mp4' : 'image/jpeg';
+              const randomSuffix = Math.floor(Math.random() * 1000);
+
+              if (message.media_type === 'document') {
+                const originalFilename = (message.content || '|').split('|')[0];
+                ext = originalFilename.split('.').pop() || 'bin';
+                mimeType = '*/*'; // Deixa o Supabase inferir pelo nome do arquivo
+                filename = `${message.sender_code}-${tempTime}-${randomSuffix}.${ext}`;
+              } else { // Imagem ou Vídeo
+                ext = message.media_type === 'video' ? 'mp4' : 'jpg';
+                mimeType = message.media_type === 'video' ? 'video/mp4' : 'image/jpeg';
+                filename = `${message.sender_code}-${tempTime}-${randomSuffix}.${ext}`;
+              }
 
               let fileBody;
               try {
@@ -962,14 +991,24 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (err) { console.error(err); }
   };
 
-  const handleUploadAndSendMedia = async (uri, mediaType, fileSize) => {
+  const handleUploadAndSendMedia = async (uri, mediaType, fileSize, fileName = null) => {
     // 🚀 Formata o tamanho do arquivo para MB ou KB
     let sizeStr = '';
     if (fileSize) {
       const mb = fileSize / (1024 * 1024);
       sizeStr = mb < 1 ? (fileSize / 1024).toFixed(0) + ' KB' : mb.toFixed(1) + ' MB';
     }
-    const finalContent = sizeStr || (mediaType === 'video' ? '📹 Vídeo' : '📷 Foto');
+
+    let finalContent;
+    if (mediaType === 'document') {
+      // 🚀 Formato especial para guardar nome e tamanho no mesmo campo, evitando mexer no banco
+      finalContent = `${fileName || 'Documento'}|${sizeStr}`;
+    } else if (mediaType.includes('_spoiler')) {
+      // 🚀 Mensagem para mídias com spoiler
+      finalContent = '🤫 Mídia com Spoiler';
+    } else {
+      finalContent = sizeStr || (mediaType === 'video' ? '📹 Vídeo' : '📷 Foto');
+    }
 
     // 🚀 Enfileira a mídia na hora (permitindo envio offline fluido e retries eternos do Upload)
     let newTime = getSyncedTime();
@@ -991,6 +1030,34 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
     setPendingQueueSynced(prev => [newPendingMessage, ...prev]);
     setReplyingTo(null);
+  };
+
+  const handleDownloadAndShareFile = async (url, content) => {
+    try {
+      const [filename, filesize] = (content || '|').split('|');
+      if (!filename) {
+        alert("Informações do arquivo ausentes. Não é possível baixar.");
+        return;
+      }
+      const localUri = `${FileSystem.cacheDirectory}${filename.replace(/[^a-zA-Z0-9.\-_]/g, '_')}`;
+
+      const fileInfo = await FileSystem.getInfoAsync(localUri);
+      if (fileInfo.exists) {
+        if (setPickerActive) setPickerActive(true);
+        await Sharing.shareAsync(localUri);
+        return;
+      }
+
+      alert(`Baixando "${filename}" (${filesize})...`);
+      const { uri } = await FileSystem.downloadAsync(url, localUri);
+      if (setPickerActive) setPickerActive(true);
+      await Sharing.shareAsync(uri);
+    } catch (error) {
+      console.error("Error downloading or sharing file:", error);
+      alert("Não foi possível abrir o arquivo.");
+    } finally {
+      if (setPickerActive) setPickerActive(false);
+    }
   };
 
   const handleDownloadMedia = async (url, mediaType = 'image') => {
@@ -1051,7 +1118,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     setAttachMenuVisible(false);
     try {
       if (setPickerActive) setPickerActive(true); // Ativa ANTES de pedir as permissões!
-      
+
       const resPhoto = await ImagePicker.requestMediaLibraryPermissionsAsync();
       const resCam = await ImagePicker.requestCameraPermissionsAsync();
       if (!resPhoto.granted || !resCam.granted) {
@@ -1060,21 +1127,25 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       }
 
       let result = null;
+      let isSpoiler = false;
       if (type === 'camera_photo') {
-        result = await ImagePicker.launchCameraAsync({ 
-          mediaTypes: ImagePicker.MediaTypeOptions.Images, 
+        result = await ImagePicker.launchCameraAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.Images,
           allowsEditing: true, // 🚀 Permite cortar e editar se tirar foto na hora
           quality: 0.5 // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
         });
       } else if (type === 'camera_video') {
-        result = await ImagePicker.launchCameraAsync({ 
-          mediaTypes: ImagePicker.MediaTypeOptions.Videos, 
+        result = await ImagePicker.launchCameraAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.Videos,
           allowsEditing: true, // 🚀 Permite aparar o vídeo se gravado na hora
           videoQuality: 0 // 🚀 Grava o vídeo em menor resolução para economizar banco de dados
         });
-      } else if (type === 'gallery') {
-        result = await ImagePicker.launchImageLibraryAsync({ 
-          mediaTypes: ImagePicker.MediaTypeOptions.All, 
+      } else if (type === 'gallery' || type === 'gallery_spoiler') {
+        if (type === 'gallery_spoiler') {
+          isSpoiler = true;
+        }
+        result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.All,
           allowsMultipleSelection: true, // 🚀 Habilita a seleção múltipla de fotos/vídeos!
           selectionLimit: 10, // 🚀 Limite seguro para não travar a memória do aparelho
           quality: 0.5, // 🚀 Ajustado para 0.5 (Bom equilíbrio entre qualidade e tamanho)
@@ -1084,8 +1155,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       if (setPickerActive) setPickerActive(false);
 
-      if (result && !result.canceled && result.assets && result.assets.length > 0) { // Apenas para ImagePicker
-        // 🚀 Loop para fazer o upload e enviar todas as fotos selecionadas uma a uma
+      if (result && !result.canceled && result.assets && result.assets.length > 0) {
         for (const asset of result.assets) {
           let finalFileSize = asset.fileSize;
           if (!finalFileSize) {
@@ -1094,14 +1164,36 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               finalFileSize = fileInfo.size;
             } catch (e) {}
           }
-          // Garante a identificação do tipo, útil para retornos incertos do Android
           const mediaType = asset.type || (asset.uri.toLowerCase().endsWith('.mp4') ? 'video' : 'image');
-          await handleUploadAndSendMedia(asset.uri, mediaType, finalFileSize);
+          const finalMediaType = isSpoiler ? `${mediaType}_spoiler` : mediaType;
+          await handleUploadAndSendMedia(asset.uri, finalMediaType, finalFileSize, asset.filename);
         }
       }
-    } catch (err) { 
+    } catch (err) {
       if (setPickerActive) setPickerActive(false);
       console.error(err); 
+    }
+  };
+
+  const handleSelectDocument = async () => {
+    setAttachMenuVisible(false);
+    try {
+      if (setPickerActive) setPickerActive(true);
+      const result = await DocumentPicker.getDocumentAsync({
+        type: '*/*', // Permite todos os tipos de arquivo
+        copyToCacheDirectory: true,
+      });
+      if (setPickerActive) setPickerActive(false);
+
+      if (result.canceled === false) {
+        // A API mais nova retorna um array `assets`
+        const asset = result.assets[0];
+        await handleUploadAndSendMedia(asset.uri, 'document', asset.size, asset.name);
+      }
+    } catch (err) {
+      if (setPickerActive) setPickerActive(false);
+      console.error('Error picking document:', err);
+      alert('Ocorreu um erro ao selecionar o documento.');
     }
   };
 
@@ -1286,6 +1378,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
 
+    // 🚀 LÓGICA DE SPOILER
+    const isSpoiler = item.media_type?.includes('_spoiler');
+    const isRevealed = revealedSpoilers.has(item.id);
+
     // 🚀 LÓGICA WHATSAPP: Verifica se a mensagem contém APENAS emojis (1 a 3 emojis no máximo)
     let isEmojiOnly = false;
     if (!item.media_url && item.content && !quotedMsg) {
@@ -1380,15 +1476,20 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           onPress={() => {
             if (isScrolling.current) return;
 
+            if (isSpoiler && !isRevealed) {
+              setRevealedSpoilers(prev => new Set(prev).add(item.id));
+              return;
+            }
+
             if (!hasTriggeredShort.current && !hasTriggeredLong.current) {
               if (item.status === 'failed') {
                 forceManualRetry(item.id);
               } else if (item.media_url) { // 🚀 Lógica de clique em Mídia
                 if (item.media_type === 'sticker') {
                   handleStickerPress(item.media_url, item); // Abre o modal de ações para a figurinha
-                } else if (item.media_type === 'video') {
+                } else if (item.media_type === 'video' || item.media_type === 'video_spoiler') {
                   setFullscreenVideo(item.media_url);
-                } else {
+                } else if (item.media_type === 'image' || item.media_type === 'image_spoiler') {
                   setFullscreenImage(item.media_url);
                 }
               } else {
@@ -1417,12 +1518,25 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
           {item.media_url ? (
             <View>
-              {item.media_type === 'video' ? (
+              {isSpoiler && !isRevealed ? ( // 🚀 NOVO VISUAL: Bloco cinza sólido para spoiler
+                <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#334155', justifyContent: 'center', alignItems: 'center' }]}>
+                  <Ionicons name="eye-outline" size={32} color="#94a3b8" />
+                  <Text style={{ color: '#94a3b8', fontWeight: 'bold', marginTop: 8 }}>Toque para ver</Text>
+                </View>
+              ) : (item.media_type === 'video' || item.media_type === 'video_spoiler') ? (
                 <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#1E293B', overflow: 'hidden', justifyContent: 'center', alignItems: 'center' }]}>
                   <Video source={{ uri: item.media_url }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted={true} />
                   <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 24 }}><Ionicons name="play-circle" size={48} color="#fff" /></View>
                   <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url, item.media_type)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
                 </View>
+              ) : item.media_type === 'document' ? (
+                <TouchableOpacity activeOpacity={0.8} onPress={() => handleDownloadAndShareFile(item.media_url, item.content)} style={[styles.documentBubble, { width: IMAGE_SIZE }]}>
+                  <Ionicons name={getDocumentIcon(item.content)} size={40} color="#cbd5e1" />
+                  <View style={styles.documentInfo}>
+                    <Text style={styles.documentName} numberOfLines={3}>{(item.content || '|').split('|')[0] || 'Documento'}</Text>
+                    <Text style={styles.documentSize}>{(item.content || '|').split('|')[1]}</Text>
+                  </View>
+                </TouchableOpacity>
               ) : item.media_type === 'sticker' ? (
                 <View style={{ position: 'relative' }}>
                   <Image source={{ uri: item.media_url }} style={{ width: 160, height: 160 }} resizeMode="contain" />
@@ -1434,8 +1548,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 </View>
               )}
               <View style={[styles.bubbleFooter, item.media_type === 'sticker' ? { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 } : { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4, justifyContent: 'space-between', width: '100%' }]}>
-                {item.media_type !== 'sticker' && item.content && (item.content.includes('MB') || item.content.includes('KB')) ? (
-                  <Text style={[styles.messageTime, { color: timeColor, fontWeight: 'bold' }]}>{item.content}</Text>
+                {item.media_type !== 'sticker' && item.media_type !== 'document' && item.content && (item.content.includes('MB') || item.content.includes('KB')) ? (
+                  <Text style={[styles.messageTime, { color: timeColor, fontWeight: 'bold' }]}>{(item.content || '').split('|')[0]}</Text>
                 ) : <View />}
                 <View style={{ flexDirection: 'row', alignItems: 'center' }}>
                   <Text style={[styles.messageTime, { color: item.media_type === 'sticker' ? '#fff' : timeColor }]}>{timeString}</Text>
@@ -1469,6 +1583,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     highlightedMessageId,
     showBlueTicks,
     messages,
+    revealedSpoilers,
     pendingQueue,
     replyingTo,
     SCREEN_WIDTH,
@@ -1600,10 +1715,12 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <TouchableOpacity onPress={() => setAttachMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Ionicons name="attach-outline" size={24} color="#64748B" />
             </TouchableOpacity>
-            <TextInput ref={textInputRef} style={[styles.textInput, { marginRight: 4 }]} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
-            <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={[styles.attachBtn, { marginRight: 8 }]} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-              <Ionicons name="happy-outline" size={26} color="#64748B" />
-            </TouchableOpacity>
+            <View style={styles.textInputContainer}>
+              <TextInput ref={textInputRef} style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
+              <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={styles.giphyBtnInside} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Ionicons name="happy-outline" size={26} color="#64748B" />
+              </TouchableOpacity>
+            </View>
             <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
           </View>
         </View>
@@ -1613,10 +1730,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       <Modal animationType="fade" transparent visible={attachMenuVisible} onRequestClose={() => setAttachMenuVisible(false)}>
         <TouchableOpacity style={styles.attachMenuOverlay} activeOpacity={1} onPress={() => setAttachMenuVisible(false)}>
           <View style={styles.attachMenuContent}>
-            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={22} color="#00ff66" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Foto)</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={22} color="#ef4444" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Câmera (Vídeo)</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_photo')}><Ionicons name="camera-outline" size={22} color="#00ff66" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Foto</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('camera_video')}><Ionicons name="videocam-outline" size={22} color="#ef4444" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Vídeo</Text></TouchableOpacity>
             <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('gallery')}><Ionicons name="images-outline" size={22} color="#3b82f6" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Galeria</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.attachMenuItem} onPress={() => { setAttachMenuVisible(false); setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }}><Ionicons name="happy-outline" size={22} color="#f59e0b" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>GIFS</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={handleSelectDocument}><Ionicons name="document-text-outline" size={22} color="#8b5cf6" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Documento</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.attachMenuItem} onPress={() => handleSelectMedia('gallery_spoiler')}><Ionicons name="eye-off-outline" size={22} color="#f472b6" style={{ marginRight: 15 }} /><Text style={styles.menuItemText}>Spoiler</Text></TouchableOpacity>
           </View>
         </TouchableOpacity>
       </Modal>
@@ -1997,7 +2115,18 @@ const styles = StyleSheet.create({
   inputWrapper: { borderTopWidth: 1, borderTopColor: '#111', paddingBottom: Platform.OS === 'ios' ? 10 : 48, paddingTop: 10 },
   inputContainer: { flexDirection: 'row', alignItems: 'flex-end', paddingHorizontal: 12 },
   attachBtn: { padding: 8, marginRight: 4, marginBottom: 2 },
-  textInput: { flex: 1, minHeight: 42, width: 0, backgroundColor: '#111827', color: '#fff', borderRadius: 22, paddingHorizontal: 16, paddingTop: 10, paddingBottom: 10, fontSize: 15, maxHeight: 120, marginRight: 10, textAlignVertical: 'center' },
+  textInputContainer: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    minHeight: 42,
+    backgroundColor: '#111827',
+    borderRadius: 22,
+    paddingHorizontal: 16,
+    marginRight: 10,
+  },
+  textInput: { flex: 1, width: 0, color: '#fff', paddingTop: 10, paddingBottom: 10, fontSize: 15, maxHeight: 120, textAlignVertical: 'center' },
+  giphyBtnInside: { paddingLeft: 8, paddingBottom: 8 },
   sendBtn: { backgroundColor: '#00ff66', width: 42, height: 42, borderRadius: 21, justifyContent: 'center', alignItems: 'center', marginBottom: 1 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'flex-start', alignItems: 'flex-end', paddingRight: 15, paddingTop: Platform.OS === 'android' ? 65 : 70 },
   menuContent: { backgroundColor: '#0d0d0d', borderRadius: 16, padding: 15, borderWidth: 1, borderColor: '#1F2937', maxWidth: 320 },
@@ -2075,4 +2204,25 @@ const styles = StyleSheet.create({
   giphyEmptySubtitle: { color: '#64748B', marginTop: 5, textAlign: 'center', fontSize: 14 },
   giphyEmptySubtitleError: { color: '#9ca3af', marginTop: 5, textAlign: 'center', fontSize: 14 },
   giphyEmptyDetails: { color: '#ef4444', marginTop: 10, textAlign: 'center', fontSize: 11, fontFamily: 'monospace' },
+  documentBubble: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(30, 41, 59, 0.5)',
+    padding: 12,
+    borderRadius: 14,
+  },
+  documentInfo: {
+    flex: 1,
+    marginLeft: 12,
+  },
+  documentName: {
+    color: '#f1f5f9',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  documentSize: {
+    color: '#94a3b8',
+    fontSize: 12,
+    marginTop: 4,
+  },
 });
