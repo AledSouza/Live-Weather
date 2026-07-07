@@ -7,7 +7,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
-import { Audio, Video, ResizeMode } from 'expo-av';
+import { Audio, Video, ResizeMode, InterruptionModeIOS, InterruptionModeAndroid } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as MediaLibrary from 'expo-media-library';
 import * as ScreenCapture from 'expo-screen-capture';
@@ -15,6 +15,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Sharing from 'expo-sharing';
 import * as Clipboard from 'expo-clipboard';
+import Slider from '@react-native-community/slider';
 // import * as Notifications from 'expo-notifications';
 import { supabase } from '../supabase';
 import { sendWeatherNotification } from './notificationService';
@@ -30,7 +31,7 @@ const syncTimeWithServer = async () => {
   if (isTimeSynced) return;
   try {
     const start = Date.now();
-    
+
     // Tentativa 1: HEAD (Rápido, mas pode ser bloqueado por proxies/redes corporativas)
     let res = await fetch(`${SUPABASE_URL}/rest/v1/`, { method: 'HEAD' }).catch(() => null);
 
@@ -82,15 +83,99 @@ const getDocumentIcon = (content) => {
   return 'document-text-outline';
 };
 
+// 🚀 Formata milissegundos em MM:SS (usado pelo player de áudio)
+const formatAudioMillis = (millis) => {
+  if (!millis) return '0:00';
+  const totalSeconds = Math.floor(millis / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+};
+
+// 🚀 Gera um padrão de "forma de onda" decorativo e determinístico a partir do id da mensagem.
+// Não reflete o áudio real (não temos acesso à amplitude), mas dá o visual estilo WhatsApp
+// e é sempre igual para a mesma mensagem (não "pisca" trocando de forma a cada render).
+const generateWaveformBars = (seed, count = 27) => {
+  const str = String(seed || 'default');
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash * 31 + str.charCodeAt(i)) & 0xffffffff;
+  }
+  let currentSeed = Math.abs(hash) || 1;
+  const bars = [];
+  for (let i = 0; i < count; i++) {
+    // Gerador pseudo-aleatório simples e determinístico (LCG)
+    currentSeed = (currentSeed * 1103515245 + 12345) & 0x7fffffff;
+    const normalized = (currentSeed % 100) / 100; // 0 a 1
+    bars.push(4 + Math.round(normalized * 16)); // Altura entre 4 e 20
+  }
+  return bars;
+};
+
+// 🚀 COMPONENTE DO PLAYER DE ÁUDIO — visual estilo WhatsApp (botão circular + "forma de onda")
+// Extraído para fora do componente principal e recebendo tudo via props: assim ele sempre
+// renderiza com os dados mais recentes de reprodução, corrigindo o slider que não acompanhava o áudio.
+const AudioBubble = React.memo(({ item, width, isThisAudioLoaded, isPlaying, positionMillis, durationMillis, onToggle, onSeek, timeString, timeColor, statusIcon, isMyMessage }) => {
+  const progress = isThisAudioLoaded && durationMillis > 0 ? positionMillis / durationMillis : 0;
+  const bars = React.useMemo(() => generateWaveformBars(item.id), [item.id]);
+  const [waveformWidth, setWaveformWidth] = useState(0);
+
+  const handleWaveformPress = (e) => {
+    if (!waveformWidth) return;
+    const x = e.nativeEvent.locationX;
+    const ratio = Math.max(0, Math.min(1, x / waveformWidth));
+    onSeek(ratio);
+  };
+
+  return (
+    <View style={[styles.audioBubble, { width }]}>
+      <TouchableOpacity onPress={() => onToggle(item)} style={styles.audioPlayCircle} activeOpacity={0.8}>
+        <Ionicons name={isPlaying ? 'pause' : 'play'} size={18} color="#0d0d0d" style={!isPlaying && { marginLeft: 2 }} />
+      </TouchableOpacity>
+      <View style={styles.audioContentContainer}>
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={handleWaveformPress}
+          onLayout={(e) => setWaveformWidth(e.nativeEvent.layout.width)}
+          style={styles.waveformContainer}
+        >
+          {bars.map((h, i) => {
+            const barPosition = bars.length > 1 ? i / (bars.length - 1) : 0;
+            const isPast = barPosition <= progress;
+            return (
+              <View
+                key={i}
+                style={[
+                  styles.waveformBar,
+                  { height: h, backgroundColor: isPast ? '#00ff66' : 'rgba(255,255,255,0.25)' }
+                ]}
+              />
+            );
+          })}
+        </TouchableOpacity>
+        <View style={styles.audioFooter}>
+          <Text style={styles.audioDurationText}>
+            {isThisAudioLoaded && positionMillis > 0 ? formatAudioMillis(positionMillis) : (item.content || '0:00')}
+          </Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <Text style={[styles.messageTime, { color: timeColor }]}>{timeString}</Text>
+            {isMyMessage && statusIcon}
+          </View>
+        </View>
+      </View>
+    </View>
+  );
+});
+
 const SwipeableMessage = ({ children, onReply }) => {
   const pan = useRef(new Animated.Value(0)).current;
   const panResponder = useRef(
     PanResponder.create({
       // 🚀 TRAVA RIGOROSA: Ignora qualquer arraste se o dedo se mover na vertical (rolagem de tela)
       onMoveShouldSetPanResponder: (_, gestureState) => gestureState.dx > 25 && Math.abs(gestureState.dy) < 15,
-      onPanResponderMove: (_, gestureState) => { 
+      onPanResponderMove: (_, gestureState) => {
         // Efeito de fricção (elástico): a mensagem move menos que o dedo, exigindo intenção real
-        if (gestureState.dx > 0) pan.setValue(gestureState.dx * 0.45); 
+        if (gestureState.dx > 0) pan.setValue(gestureState.dx * 0.45);
       },
       onPanResponderRelease: (_, gestureState) => {
         if (gestureState.dx > 70) onReply();
@@ -102,7 +187,7 @@ const SwipeableMessage = ({ children, onReply }) => {
 
   return (
     <View style={styles.swipeContainer}>
-      <Animated.View style={[styles.replyIconLeft, { 
+      <Animated.View style={[styles.replyIconLeft, {
         opacity: pan.interpolate({ inputRange: [0, 15], outputRange: [0, 1], extrapolate: 'clamp' }),
         transform: [{ scale: pan.interpolate({ inputRange: [0, 25], outputRange: [0.3, 1], extrapolate: 'clamp' }) }]
       }]}>
@@ -133,6 +218,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [replyingTo, setReplyingTo] = useState(null);
   const [fullscreenImage, setFullscreenImage] = useState(null);
   const [fullscreenVideo, setFullscreenVideo] = useState(null);
+  const [fullscreenMediaList, setFullscreenMediaList] = useState([]); // 🚀 Lista de mídias para navegação
+  const [fullscreenMediaIndex, setFullscreenMediaIndex] = useState(0); // 🚀 Índice da mídia atual
 
   const [reactionTargetMessage, setReactionTargetMessage] = useState(null);
   const [showCustomEmojiInput, setShowCustomEmojiInput] = useState(false);
@@ -147,7 +234,20 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [renderKey, setRenderKey] = useState(0);
   const [pinnedMessage, setPinnedMessage] = useState(null);
 
+  // 🚀 ESTADOS DE GRAVAÇÃO E REPRODUÇÃO DE ÁUDIO
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPaused, setIsPaused] = useState(false); // 🚀 Indica se a gravação de áudio está pausada
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [currentlyPlaying, setCurrentlyPlaying] = useState(null); // id da mensagem de áudio tocando
+  const [playbackStatus, setPlaybackStatus] = useState(null);
   const [revealedSpoilers, setRevealedSpoilers] = useState(new Set());
+
+  // 🚀 ESTADOS DE PRÉ-VISUALIZAÇÃO DO ÁUDIO GRAVADO (antes de enviar, estilo WhatsApp)
+  const [recordedPreview, setRecordedPreview] = useState(null); // { uri, duration, size }
+  const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
+  const [previewStatus, setPreviewStatus] = useState(null);
+  const previewSoundRef = useRef(new Audio.Sound());
+
   // 🚀 ESTADOS DE SUGESTÃO DE STICKER (Como no WhatsApp/Telegram)
   const [emojiSuggestions, setEmojiSuggestions] = useState([]);
   const [showEmojiSuggestions, setShowEmojiSuggestions] = useState(false);
@@ -158,6 +258,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [selectedSticker, setSelectedSticker] = useState(null); // { url: string, isFavorite: boolean, message: object }
 
   const roomKey = [userCode.trim().toLowerCase(), friendCode.trim().toLowerCase()].sort().join('-');
+  const recordingRef = useRef(null);
+  const recordingTimerRef = useRef(null);
+  const audioPlayerRef = useRef(new Audio.Sound());
+
 
   // 🚀 LÓGICA DE EXCEÇÃO DE PRIVACIDADE: Libera o print/gravação de tela APENAS ao ver mídias em tela cheia
   useEffect(() => {
@@ -192,6 +296,22 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const backHandler = BackHandler.addEventListener('hardwareBackPress', backAction);
     return () => backHandler.remove();
   }, [fullscreenImage, fullscreenVideo]);
+
+  // 🚀 EFEITO: Descarrega o player de áudio e a gravação ao sair da tela para liberar memória
+  useEffect(() => {
+    return () => {
+      audioPlayerRef.current.unloadAsync().catch(() => {});
+      previewSoundRef.current.unloadAsync().catch(() => {}); // 🚀 Descarrega também o player de pré-visualização
+      // 🚀 Garante que a gravação seja interrompida e liberada se o usuário sair da tela
+      if (recordingRef.current) {
+        recordingRef.current.stopAndUnloadAsync().catch(() => {});
+      }
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+      }
+    };
+  }, []);
+
 
   const fetchPinnedMessage = async () => {
     try {
@@ -235,7 +355,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     try {
       // 🚀 Excluímos o pin antigo manualmente para garantir que não haja duplicidade sem precisar de restrições em SQL
       await supabase.from('pins').delete().eq('room_key', roomKey);
-      
+
       const { error } = await supabase.from('pins').insert([
         { message_id: message.id, pinned_by: userCode, room_key: roomKey }
       ]);
@@ -245,8 +365,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       setPinnedMessage(message);
       setInfoModalMessage(null);
       setReactionTargetMessage(null);
-    } catch (e) { 
-      console.warn('Erro ao fixar:', e); 
+    } catch (e) {
+      console.warn('Erro ao fixar:', e);
       alert(`Falha do Servidor: ${e.message || 'A mensagem não pôde ser fixada.'}`);
     }
   };
@@ -286,7 +406,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [giphyOffset, setGiphyOffset] = useState(0);
   const [giphyError, setGiphyError] = useState(null);
   const [recentGifs, setRecentGifs] = useState([]);
-  const [favoriteGifs, setFavoriteGifs] = useState([]); // 🚀 NOVO: Favoritos
+  const [favoriteGifs, setFavoriteGifs] = useState([]); // 🚀 Favoritos
   const [giphyTab, setGiphyTab] = useState('recent'); // 'search', 'recent' ou 'favorites'
   const GIPHY_API_KEY = 'u9JYVOpH3aNfJmB3qJWc5E42ln1kiwr9'; // Chave pessoal da API Giphy
   const GIPHY_PAGE_LIMIT = 24;
@@ -324,11 +444,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const date = new Date(isoString);
     const today = new Date(getSyncedTime());
     const isToday = date.getDate() === today.getDate() && date.getMonth() === today.getMonth() && date.getFullYear() === today.getFullYear();
-    
+
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
     const isYesterday = date.getDate() === yesterday.getDate() && date.getMonth() === yesterday.getMonth() && date.getFullYear() === yesterday.getFullYear();
-    
+
     const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     if (isToday) return `visto por último hoje às ${timeStr}`;
     if (isYesterday) return `visto por último ontem às ${timeStr}`;
@@ -339,6 +459,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const channelRef = useRef(null);
   const { width: SCREEN_WIDTH } = useWindowDimensions();
   const IMAGE_SIZE = Math.min(SCREEN_WIDTH * 0.65, 320);
+  const AUDIO_BUBBLE_WIDTH = Math.min(SCREEN_WIDTH * 0.6, 280);
 
   useEffect(() => {
     // 🚀 Atualiza o SEU visto por último ao entrar no canal
@@ -375,7 +496,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         if (savedBg && !savedBg.startsWith('#')) setChatBackground(savedBg);
         if (savedMy) setMyBubbleColor(savedMy);
         if (savedTheir) setTheirBubbleColor(savedTheir);
-        
+
         const savedEmojis = await AsyncStorage.getItem('@recent_emojis');
         if (savedEmojis) setRecentEmojis(JSON.parse(savedEmojis));
 
@@ -463,7 +584,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const handleSendSticker = async (stickerUrl) => {
     setGiphyModalVisible(false);
-    
+
     // 🚀 Salva a figurinha nos Recentes (sem limite)
     setRecentGifs(prev => {
       const updated = [stickerUrl, ...prev.filter(g => g !== stickerUrl)];
@@ -492,7 +613,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     setReplyingTo(null);
   };
 
-  // 🚀 NOVO: Lógica para favoritar/desfavoritar GIFs com toque longo
+  // 🚀 Lógica para favoritar/desfavoritar GIFs com toque longo
   const handleToggleFavoriteGif = async (stickerUrl, showAlert = true) => {
     const isFavorited = favoriteGifs.includes(stickerUrl);
     let updated;
@@ -507,7 +628,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     await AsyncStorage.setItem('@favorite_gifs', JSON.stringify(updated));
   };
 
-  // 🚀 NOVO: Abre o modal de ação ao clicar em um sticker
+  // 🚀 Abre o modal de ação ao clicar em um sticker
   const handleStickerPress = (stickerUrl, messageItem) => {
     const isFavorite = favoriteGifs.includes(stickerUrl);
     setSelectedSticker({ url: stickerUrl, isFavorite, message: messageItem });
@@ -626,13 +747,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 contentType: mimeType,
                 upsert: false
               });
-              
+
               // 🚀 FIX: Proteção de Timeout também no Upload para não travar toda a fila de mensagens
               let uploadTimeoutId;
               const uploadTimeoutPromise = new Promise((_, reject) => {
                 uploadTimeoutId = setTimeout(() => reject(new Error('Timeout no upload da mídia')), 30000);
               });
-              
+
               const { error: uploadError } = await Promise.race([uploadPromise, uploadTimeoutPromise]).catch(err => {
                 clearTimeout(uploadTimeoutId);
                 throw err;
@@ -641,7 +762,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               if (uploadError) throw uploadError;
 
               finalMediaUrl = `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
-              
+
               // Remove a flag de upload para que, se a inserção no banco falhar, o app não upe a foto repetida vezes no storage
               setPendingQueueSynced(prev => prev.map(m => m.id === message.id ? { ...m, media_url: finalMediaUrl, needs_upload: false } : m));
             }
@@ -656,22 +777,22 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             if (message.media_type) payload.media_type = message.media_type;
 
             const insertPromise = supabase.from('mensagens').insert([payload]).select().single();
-            
+
             // 🚀 CORREÇÃO DA BOMBA-RELÓGIO: Limpa o timeout para não causar crash silencioso no motor de Tempo Real
             let timeoutId;
             const timeoutPromise = new Promise((_, reject) => {
               timeoutId = setTimeout(() => reject(new Error('Timeout de rede')), 30000); // 🚀 Aumentado para 30s (ajuda no 3G/4G ruim)
             });
-            
+
             const res = await Promise.race([insertPromise, timeoutPromise]).catch(err => {
               clearTimeout(timeoutId);
               throw err;
             });
             clearTimeout(timeoutId);
-            
+
             const { data, error } = res;
             if (error) throw error;
-            
+
             // 🚀 SUCESSO ABSOLUTO! Remove da fila e transfere para a tela de chat na hora
             setPendingQueueSynced(prev => prev.filter(m => m.id !== message.id));
             setMessages(prev => {
@@ -690,7 +811,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               setPendingQueueSynced(prev => prev.map(m => m.id === message.id ? { ...m, status: 'failed' } : m));
             }
             // Aborta para manter a ordem cronológica estrita
-            break; 
+            break;
           }
         } else {
           // Trava a fila se a mensagem atual ainda está aguardando confirmação do servidor
@@ -708,13 +829,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     };
 
     const intervalId = setInterval(queueWorker, 1000);
-    queueWorker(); 
+    queueWorker();
 
     return () => {
       clearInterval(intervalId);
       processingIds.clear();
     };
-      }, [userCode, friendCode]); // 🚀 CORREÇÃO: Impede falha na fila ao trocar de chats
+  }, [userCode, friendCode]); // 🚀 CORREÇÃO: Impede falha na fila ao trocar de chats
 
   useEffect(() => {
     // Busca o visto por último inicial do contato
@@ -766,11 +887,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           const newMsg = payload.new;
           if ((newMsg.sender_code === userCode && newMsg.receiver_code === friendCode) || (newMsg.sender_code === friendCode && newMsg.receiver_code === userCode)) {
             setMessages((prev) => {
-              if (prev.some(m => m.id === newMsg.id)) return prev;
-              const updated = [newMsg, ...prev];
-              const finalSorted = updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-              AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(finalSorted.slice(0, 60))).catch(() => {});
-              return finalSorted;
+              if (prev.some(m => m.id === newMsg.id)) return prev; // Evita duplicatas
+              const updated = [newMsg, ...prev]; // Prepend a nova mensagem para FlatList invertida
+              AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(updated.slice(0, 60))).catch(() => {});
+              return updated;
             });
             if (newMsg.sender_code === userCode) {
               setPendingQueueSynced(prev => {
@@ -818,11 +938,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           .or(`and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode})`)
           .order('created_at', { ascending: false })
           .limit(30);
-        
+
         if (data) {
-          const hasUnread = data.some(m => 
-            m.sender_code === friendCode && 
-            m.receiver_code === userCode && 
+          const hasUnread = data.some(m =>
+            m.sender_code === friendCode &&
+            m.receiver_code === userCode &&
             !m.read_at
           );
           if (hasUnread) marcarComoLidas();
@@ -831,23 +951,37 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           setMessages(prev => {
             const pendingIds = new Set(pendingQueueRef.current.map(m => m.id));
             let changed = false;
-            
-            // Atualiza mensagens existentes (ex: read_at preenchido) E adiciona novas
-            const updated = prev.map(p => {
-              const fresh = filteredData.find(m => m.id === p.id);
-              if (fresh && (fresh.read_at !== p.read_at || JSON.stringify(fresh.reacoes) !== JSON.stringify(p.reacoes))) { changed = true; return fresh; }
-              return p;
+
+            // Cria um mapa para busca rápida de mensagens do poll
+            const pollDataMap = new Map(filteredData.map(m => [m.id, m]));
+
+            // Coleta novas mensagens do poll que não estão em 'prev' e não estão em 'pendingQueue'
+            const newMessagesFromPoll = filteredData.filter(m =>
+              !prev.some(p => p.id === m.id) && !pendingIds.has(m.id)
+            );
+
+            // Se houver novas mensagens do poll, as prepend.
+            // Isso garante que elas apareçam no topo da lista invertida.
+            let currentMessages = [...newMessagesFromPoll, ...prev];
+            if (newMessagesFromPoll.length > 0) changed = true;
+
+            // Agora, atualiza as mensagens existentes em `currentMessages` com dados de `pollDataMap`
+            currentMessages = currentMessages.map(msg => {
+              const fresh = pollDataMap.get(msg.id);
+              if (fresh && (fresh.read_at !== msg.read_at || JSON.stringify(fresh.reacoes) !== JSON.stringify(msg.reacoes) || fresh.content !== msg.content)) {
+                changed = true;
+                return fresh; // Usa a versão atualizada do poll
+              }
+              return msg; // Mantém o original se não houver atualização
             });
-            
-            const existingIds = new Set(prev.map(p => p.id));
-            const newMsgs = filteredData.filter(m => !existingIds.has(m.id) && !pendingIds.has(m.id));
-            if (newMsgs.length > 0) { changed = true; updated.push(...newMsgs); }
-            
-            if (!changed) return prev; // Sem mudanças, não re-renderiza
-            
-            const sorted = updated.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-            AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(sorted.slice(0, 60))).catch(() => {});
-            return sorted;
+
+            if (!changed) return prev; // Sem mudanças reais, evita re-renderização
+
+            // O array `currentMessages` agora deve estar ordenado corretamente (mais novo primeiro)
+            // porque as novas mensagens foram prepended e as existentes atualizadas no lugar.
+            // Nenhuma ordenação completa é necessária aqui, o que deve evitar os saltos.
+            AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(currentMessages.slice(0, 60))).catch(() => {});
+            return currentMessages;
           });
         }
       } catch (err) { console.warn('Erro no polling:', err); }
@@ -878,7 +1012,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     // 🚀 Removemos o 'await' para não engasgar o teclado ao digitar rápido
     AsyncStorage.setItem(`@draft_${userCode}_${friendCode}`, text).catch(() => {});
 
-    // 🚀 NOVO: Chama a busca por sugestões de emoji
+    // 🚀 Chama a busca por sugestões de emoji
     fetchEmojiSuggestions(text);
   };
 
@@ -892,10 +1026,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       textInputRef.current?.focus(); // Devolve o foco se tentou enviar vazio
       return;
     }
-    
+
     const messageContent = currentText.trim();
     const currentReplyId = replyingTo ? replyingTo.id : null;
-    
+
     inputTextRef.current = '';
     setShowEmojiSuggestions(false); // Esconde sugestões ao enviar
     setInputText('');
@@ -1003,6 +1137,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     if (mediaType === 'document') {
       // 🚀 Formato especial para guardar nome e tamanho no mesmo campo, evitando mexer no banco
       finalContent = `${fileName || 'Documento'}|${sizeStr}`;
+    } else if (mediaType === 'audio') {
+      // Para áudio, o fileName é a duração (ex: "0:45")
+      finalContent = fileName;
     } else if (mediaType.includes('_spoiler')) {
       // 🚀 Mensagem para mídias com spoiler
       finalContent = '🤫 Mídia com Spoiler';
@@ -1081,7 +1218,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         );
         return;
       }
-      
+
       let uriToSave = url;
 
       // 🚀 Se a URL for da internet (Supabase), nós baixamos o arquivo primeiro
@@ -1090,11 +1227,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         const rawFilename = url.split('/').pop().split('?')[0];
         const fallbackExt = mediaType === 'video' ? 'mp4' : 'jpg';
         const filename = rawFilename.includes('.') ? rawFilename : `${rawFilename}.${fallbackExt}`;
-        
+
         // Usa documentDirectory (permanente). O Android aborta a cópia de vídeos se estiverem no cache!
         const fileUri = `${FileSystem.documentDirectory}${Date.now()}-${filename}`;
         const downloadRes = await FileSystem.downloadAsync(url, fileUri);
-        
+
         const fileInfo = await FileSystem.getInfoAsync(downloadRes.uri);
         if (!fileInfo.exists || (typeof fileInfo.size === 'number' && fileInfo.size === 0)) {
           throw new Error('Arquivo baixado está vazio ou corrompido');
@@ -1104,7 +1241,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
       // 🚀 Salva direto na pasta oficial Pictures (O Google Fotos identifica na hora!)
       await MediaLibrary.createAssetAsync(uriToSave);
-      
+
       if (setPickerActive) setPickerActive(false);
       Alert.alert('Salvo!', 'Mídia salva na galeria com sucesso.');
     } catch (err) {
@@ -1112,6 +1249,32 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       console.error('Download error:', err);
       Alert.alert('Erro ao salvar', err.message ?? JSON.stringify(err));
     }
+  };
+
+  // 🚀 CORREÇÃO: Abre a mídia em tela cheia e fecha a galeria ao mesmo tempo,
+  // resolvendo o bug onde a mídia só aparecia depois de fechar a galeria manualmente.
+  const handleOpenMediaFromGallery = (item) => {
+    // 1. Filtra todas as mídias válidas para a galeria
+    const mediaItems = messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
+    // 2. Encontra o índice do item clicado
+    const initialIndex = mediaItems.findIndex(m => m.id === item.id);
+
+    // 3. Define a lista e o índice para o modal de tela cheia
+    setFullscreenMediaList(mediaItems);
+    setFullscreenMediaIndex(initialIndex);
+
+    // 4. Fecha a galeria
+    setMediaGalleryVisible(false);
+
+    // Adiciona um pequeno delay para garantir que o modal da galeria fechou antes de abrir o da mídia
+    setTimeout(() => {
+      // 5. Abre a mídia em tela cheia
+      if (item.media_type?.startsWith('video')) {
+        setFullscreenVideo(item.media_url);
+      } else {
+        setFullscreenImage(item.media_url);
+      }
+    }, 50); // 50ms é suficiente para a transição e imperceptível ao usuário
   };
 
   const handleSelectMedia = async (type) => {
@@ -1171,8 +1334,288 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       }
     } catch (err) {
       if (setPickerActive) setPickerActive(false);
-      console.error(err); 
+      console.error(err);
     }
+  };
+
+  // 🚀 FUNÇÕES DE GRAVAÇÃO DE ÁUDIO
+  // 🚀 BLINDADAS CONTRA CRASH: qualquer falha aqui é capturada e tratada, nunca propagada
+  // como uma exceção não tratada (essa era a causa provável do app reiniciar sozinho ao gravar).
+  const startRecording = async () => {
+    // 🚀 GUARDA: Impede o início de uma nova gravação se uma já estiver em andamento.
+    if (isRecording || recordingRef.current) {
+      console.warn('Tentativa de iniciar gravação duplicada foi ignorada.');
+      return;
+    }
+
+    try {
+      // 🚀 Libera a sessão de áudio: para/descarrega qualquer áudio em reprodução (mensagens
+      // já enviadas ou a pré-visualização) antes de pedir o microfone. Tentar gravar com um
+      // player de áudio ainda ativo é uma causa comum de crash nativo em alguns Androids.
+      await audioPlayerRef.current.stopAsync().catch(() => {});
+      await audioPlayerRef.current.unloadAsync().catch(() => {});
+      setCurrentlyPlaying(null);
+      setPlaybackStatus(null);
+
+      await previewSoundRef.current.stopAsync().catch(() => {});
+      await previewSoundRef.current.unloadAsync().catch(() => {});
+      setIsPreviewPlaying(false);
+      setPreviewStatus(null);
+
+      // 🚀 Verifica a permissão antes de pedir; nunca deixa a checagem escapar sem tratamento
+      let permissions = await Audio.getPermissionsAsync().catch((err) => {
+        console.warn('Falha ao checar permissão de áudio', err);
+        return { granted: false, status: 'undetermined' };
+      });
+
+      if (!permissions?.granted) {
+        if (setPickerActive) setPickerActive(true);
+        permissions = await Audio.requestPermissionsAsync().catch((err) => {
+          console.error('Falha ao pedir permissão de áudio', err);
+          return { granted: false, status: 'denied' };
+        });
+        if (setPickerActive) setPickerActive(false);
+      }
+
+      if (!permissions?.granted) {
+        alert('Permissão para acessar o microfone é necessária!');
+        return;
+      }
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+        shouldDuckAndroid: true,
+        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+        playThroughEarpieceAndroid: false,
+        staysActiveInBackground: false,
+      });
+
+      const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      recordingRef.current = recording;
+      setIsRecording(true);
+      setIsPaused(false); // 🚀 Garante que uma gravação nova sempre comece "tocando", nunca pausada
+
+      setRecordingDuration(0);
+      recordingTimerRef.current = setInterval(() => setRecordingDuration(prev => prev + 1), 1000);
+
+    } catch (err) {
+      console.error('Falha ao iniciar gravação', err);
+      // 🚀 Limpeza de emergência em caso de falha na inicialização — nunca deixa o app em estado inconsistente
+      try {
+        if (recordingRef.current) {
+          await recordingRef.current.stopAndUnloadAsync().catch(() => {});
+        }
+      } catch (e) {
+        // Ignora: já estamos tratando um erro, não queremos lançar outro por cima
+      }
+      recordingRef.current = null;
+      setIsRecording(false);
+      setIsPaused(false);
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      setRecordingDuration(0);
+      if (setPickerActive) setPickerActive(false);
+      alert('Não foi possível iniciar a gravação. Tente novamente.');
+    }
+  };
+
+  // 🚀 PAUSA a gravação em andamento, permitindo ao usuário lembrar o que ia dizer sem perder o áudio já gravado
+  const handlePauseRecording = async () => {
+    if (!recordingRef.current || isPaused) return;
+    try {
+      clearInterval(recordingTimerRef.current);
+      await recordingRef.current.pauseAsync();
+      setIsPaused(true);
+    } catch (err) {
+      console.error('Falha ao pausar gravação', err);
+      // 🚀 Se o aparelho não suportar pausar (ex: Android antigo), reinicia o timer para não travar a contagem
+      recordingTimerRef.current = setInterval(() => setRecordingDuration(prev => prev + 1), 1000);
+      alert('Não foi possível pausar a gravação neste aparelho.');
+    }
+  };
+
+  // 🚀 RETOMA a gravação pausada, continuando exatamente de onde parou (mesmo arquivo de áudio)
+  const handleResumeRecording = async () => {
+    if (!recordingRef.current || !isPaused) return;
+    try {
+      await recordingRef.current.startAsync();
+      setIsPaused(false);
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingDuration(prev => prev + 1);
+      }, 1000);
+    } catch (err) {
+      console.error('Falha ao retomar gravação', err);
+      alert('Não foi possível retomar a gravação.');
+    }
+  };
+
+  // 🚀 CANCELA a gravação atual (pausada ou em andamento), descartando o áudio sem enviar
+  const handleCancelRecording = async () => {
+    clearInterval(recordingTimerRef.current);
+    setIsRecording(false);
+    setIsPaused(false);
+    setRecordingDuration(0);
+    try {
+      if (recordingRef.current) {
+        await recordingRef.current.stopAndUnloadAsync().catch(() => {});
+        const uri = recordingRef.current.getURI();
+        if (uri) await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      }
+      // 🚀 Libera o microfone/volta o modo de áudio ao normal para não travar reproduções futuras
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true }).catch(() => {});
+    } catch (err) {
+      console.error('Falha ao cancelar gravação', err);
+    } finally {
+      recordingRef.current = null;
+    }
+  };
+
+  const stopRecording = async () => {
+    if (!recordingRef.current) return;
+
+    setIsRecording(false);
+    clearInterval(recordingTimerRef.current);
+
+    try {
+      await recordingRef.current.stopAndUnloadAsync();
+      const uri = recordingRef.current.getURI();
+      const status = await recordingRef.current.getStatusAsync().catch(() => null);
+      const durationMillis = status?.durationMillis || 0;
+
+      const minutes = Math.floor(durationMillis / 60000);
+      const seconds = Math.floor((durationMillis % 60000) / 1000);
+      const durationStr = `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+
+      // 🚀 Devolve o modo de áudio para reprodução normal, liberando o microfone —
+      // sem isso, reproduções e futuras gravações podem falhar ou travar em alguns aparelhos
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true }).catch(() => {});
+
+      if (uri) {
+        // 🚀 Em vez de enviar direto, mostra a pré-visualização (estilo WhatsApp)
+        setRecordedPreview({ uri, duration: durationStr, size: status?.size });
+      }
+
+    } catch (error) {
+      console.error('Falha ao parar gravação', error);
+      alert('Ocorreu um problema ao finalizar a gravação.');
+    } finally {
+      recordingRef.current = null;
+      setRecordingDuration(0);
+      setIsPaused(false);
+    }
+  };
+
+  // 🚀 REPRODUÇÃO DE ÁUDIOS JÁ ENVIADOS NO CHAT (usado pelo AudioBubble)
+  const togglePlayback = async (item) => {
+    try {
+      if (isRecording) return; // 🚀 Nunca reproduz áudio enquanto uma gravação está em andamento
+
+      if (currentlyPlaying === item.id) {
+        // Já está carregado neste item: só alterna play/pause
+        if (playbackStatus?.isPlaying) {
+          await audioPlayerRef.current.pauseAsync();
+        } else {
+          await audioPlayerRef.current.playAsync();
+        }
+      } else {
+        // Troca de áudio: descarrega o anterior e carrega o novo
+        await audioPlayerRef.current.unloadAsync().catch(() => {});
+        setCurrentlyPlaying(item.id); // 🚀 Define antes de carregar para a interface já preparar o player
+        setPlaybackStatus(null); // 🚀 Zera o status anterior para não mostrar a barra de progresso do áudio antigo
+        // 🚀 Registra o callback ANTES do loadAsync para não perder a primeira atualização de status (posição/duração)
+        audioPlayerRef.current.setOnPlaybackStatusUpdate((status) => {
+          setPlaybackStatus(status);
+          if (status.didJustFinish) {
+            setCurrentlyPlaying(null);
+          }
+        });
+        await audioPlayerRef.current.loadAsync({ uri: item.media_url }, { shouldPlay: true });
+      }
+    } catch (e) {
+      console.warn('Erro ao reproduzir áudio:', e);
+      setCurrentlyPlaying(null);
+      setPlaybackStatus(null);
+    }
+  };
+
+  const seekAudio = async (value) => {
+    if (!playbackStatus?.durationMillis) return;
+    try {
+      await audioPlayerRef.current.setPositionAsync(value * playbackStatus.durationMillis);
+    } catch (e) {
+      console.warn('Erro ao buscar posição do áudio:', e);
+    }
+  };
+
+  // 🚀 REPRODUÇÃO DA PRÉ-VISUALIZAÇÃO DO ÁUDIO RECÉM-GRAVADO (antes de enviar)
+  const togglePreviewPlayback = async () => {
+    if (!recordedPreview || isRecording) return;
+    try {
+      if (isPreviewPlaying) {
+        await previewSoundRef.current.pauseAsync();
+        setIsPreviewPlaying(false);
+        return;
+      }
+
+      // 🚀 Garante que nenhum outro áudio do chat esteja tocando ao mesmo tempo
+      await audioPlayerRef.current.pauseAsync().catch(() => {});
+
+      const status = await previewSoundRef.current.getStatusAsync().catch(() => ({ isLoaded: false }));
+      if (!status.isLoaded) {
+        await previewSoundRef.current.loadAsync({ uri: recordedPreview.uri }, { shouldPlay: true });
+        previewSoundRef.current.setOnPlaybackStatusUpdate((s) => {
+          setPreviewStatus(s);
+          if (s.didJustFinish) {
+            setIsPreviewPlaying(false);
+            previewSoundRef.current.setPositionAsync(0).catch(() => {});
+          }
+        });
+      } else {
+        await previewSoundRef.current.playAsync();
+      }
+      setIsPreviewPlaying(true);
+    } catch (e) {
+      console.warn('Erro ao tocar preview:', e);
+      setIsPreviewPlaying(false);
+    }
+  };
+
+  const seekPreviewAudio = async (value) => {
+    if (!previewStatus?.durationMillis) return;
+    try {
+      await previewSoundRef.current.setPositionAsync(value * previewStatus.durationMillis);
+    } catch (e) {
+      console.warn('Erro ao buscar posição do preview:', e);
+    }
+  };
+
+  const handleDeleteRecordedPreview = async () => {
+    try {
+      await previewSoundRef.current.stopAsync().catch(() => {});
+      await previewSoundRef.current.unloadAsync().catch(() => {});
+      if (recordedPreview?.uri) {
+        await FileSystem.deleteAsync(recordedPreview.uri, { idempotent: true }).catch(() => {});
+      }
+    } finally {
+      setRecordedPreview(null);
+      setIsPreviewPlaying(false);
+      setPreviewStatus(null);
+    }
+  };
+
+  const handleSendRecordedPreview = async () => {
+    if (!recordedPreview) return;
+    const { uri, duration, size } = recordedPreview;
+
+    await previewSoundRef.current.stopAsync().catch(() => {});
+    await previewSoundRef.current.unloadAsync().catch(() => {});
+
+    setRecordedPreview(null);
+    setIsPreviewPlaying(false);
+    setPreviewStatus(null);
+
+    await handleUploadAndSendMedia(uri, 'audio', size, duration);
   };
 
   const handleSelectDocument = async () => {
@@ -1260,13 +1703,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 const { data: msgs } = await supabase.from('mensagens')
                   .select('media_url, media_type')
                   .or(`and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode})`);
-                
+
                 if (msgs && msgs.length > 0) {
                   const filesToDelete = msgs
                     .filter(m => m.media_url && !m.media_url.includes('giphy.com'))
                     .map(m => extractStoragePath(m.media_url))
                     .filter(Boolean);
-                    
+
                   if (filesToDelete.length > 0) {
                     const { error: storageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
                     if (storageError) console.error('Erro ao limpar mídias:', storageError);
@@ -1331,7 +1774,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     if (!text) return null;
     const urlRegex = /(https?:\/\/[^\s]+)/g;
     const parts = text.split(urlRegex);
-    
+
     return (
       <Text style={[styles.messageText, isFailed && { color: '#94a3b8' }, isEmojiOnly && { fontSize: 50, lineHeight: 60, textAlign: 'center' }]}>
         {parts.map((part, index) => {
@@ -1396,7 +1839,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
 
     const bubbleBaseColor = isMyMessage ? myBubbleColor : theirBubbleColor;
-    
+
     // 🚀 LÓGICA DE TRANSLUCIDEZ ABSOLUTA (Converte a cor sólida para RGBA dinâmico a 65%)
     const getTranslucentBg = (hex) => {
       let c = hex.replace('#', '');
@@ -1408,9 +1851,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     // 🚀 MAPA DE CORES COORDENADAS (Relógio e Ticks combinam perfeitamente com a cor do balão)
     const getTimeColor = (hex) => {
       const map = {
-        '#1e293b': '#94a3b8', '#2563eb': '#bfdbfe', '#16a34a': '#bbf7d0', '#d97706': '#fde68a', 
+        '#1e293b': '#94a3b8', '#2563eb': '#bfdbfe', '#16a34a': '#bbf7d0', '#d97706': '#fde68a',
         '#dc2626': '#fecaca', '#9333ea': '#e9d5ff', '#475569': '#cbd5e1', '#0284c7': '#bae6fd',
-        '#0d0d0d': '#71717a', '#3f3f46': '#a1a1aa', '#064e3b': '#a7f3d0', '#1e3a8a': '#bfdbfe', 
+        '#0d0d0d': '#71717a', '#3f3f46': '#a1a1aa', '#064e3b': '#a7f3d0', '#1e3a8a': '#bfdbfe',
         '#4c1d95': '#ddd6fe', '#881337': '#fecdd3', '#262626': '#a3a3a3'
       };
       return map[hex.toLowerCase()] || 'rgba(255,255,255,0.6)';
@@ -1498,8 +1941,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             }
           }}
       style={[
-        styles.messageBubble, 
-        isMyMessage ? styles.myBubble : styles.theirBubble, 
+        styles.messageBubble,
+        isMyMessage ? styles.myBubble : styles.theirBubble,
         { backgroundColor: bubbleBg, borderWidth: 1, borderColor: bubbleBorder, maxWidth: SCREEN_WIDTH * 0.78 },
         isEmojiOnly && { backgroundColor: 'transparent', borderWidth: 0, elevation: 0, paddingBottom: 4 },
         item.media_type === 'sticker' && { backgroundColor: 'transparent', borderWidth: 0, elevation: 0, paddingBottom: 4 },
@@ -1518,7 +1961,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
           {item.media_url ? (
             <View>
-              {isSpoiler && !isRevealed ? ( // 🚀 NOVO VISUAL: Bloco cinza sólido para spoiler
+              {isSpoiler && !isRevealed ? ( // 🚀 Bloco cinza sólido para spoiler
                 <View style={[styles.imageBubble, { width: IMAGE_SIZE, height: IMAGE_SIZE, backgroundColor: '#334155', justifyContent: 'center', alignItems: 'center' }]}>
                   <Ionicons name="eye-outline" size={32} color="#94a3b8" />
                   <Text style={{ color: '#94a3b8', fontWeight: 'bold', marginTop: 8 }}>Toque para ver</Text>
@@ -1537,6 +1980,21 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                     <Text style={styles.documentSize}>{(item.content || '|').split('|')[1]}</Text>
                   </View>
                 </TouchableOpacity>
+              ) : item.media_type === 'audio' ? (
+                <AudioBubble
+                  item={item}
+                  width={AUDIO_BUBBLE_WIDTH}
+                  isThisAudioLoaded={currentlyPlaying === item.id}
+                  isPlaying={currentlyPlaying === item.id && !!playbackStatus?.isPlaying}
+                  positionMillis={currentlyPlaying === item.id ? (playbackStatus?.positionMillis || 0) : 0}
+                  durationMillis={currentlyPlaying === item.id ? (playbackStatus?.durationMillis || 1) : 1}
+                  onToggle={togglePlayback}
+                  onSeek={seekAudio}
+                  timeString={timeString}
+                  timeColor={timeColor}
+                  statusIcon={statusIcon}
+                  isMyMessage={isMyMessage}
+                />
               ) : item.media_type === 'sticker' ? (
                 <View style={{ position: 'relative' }}>
                   <Image source={{ uri: item.media_url }} style={{ width: 160, height: 160 }} resizeMode="contain" />
@@ -1547,21 +2005,23 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                   <TouchableOpacity style={styles.downloadBtn} onPress={() => handleDownloadMedia(item.media_url, item.media_type)}><Ionicons name="download" size={18} color="#fff" /></TouchableOpacity>
                 </View>
               )}
-              <View style={[styles.bubbleFooter, item.media_type === 'sticker' ? { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 } : { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4, justifyContent: 'space-between', width: '100%' }]}>
-                {item.media_type !== 'sticker' && item.media_type !== 'document' && item.content && (item.content.includes('MB') || item.content.includes('KB')) ? (
-                  <Text style={[styles.messageTime, { color: timeColor, fontWeight: 'bold' }]}>{(item.content || '').split('|')[0]}</Text>
-                ) : <View />}
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <Text style={[styles.messageTime, { color: item.media_type === 'sticker' ? '#fff' : timeColor }]}>{timeString}</Text>
-                  {isMyMessage && statusIcon}
+              {item.media_type !== 'audio' && (
+                <View style={[styles.bubbleFooter, item.media_type === 'sticker' ? { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 } : { paddingHorizontal: 8, paddingBottom: 6, paddingTop: 4, justifyContent: 'space-between', width: '100%' }]}>
+                  {item.media_type !== 'sticker' && item.media_type !== 'document' && item.content && (item.content.includes('MB') || item.content.includes('KB')) ? (
+                    <Text style={[styles.messageTime, { color: timeColor, fontWeight: 'bold' }]}>{(item.content || '').split('|')[0]}</Text>
+                  ) : <View />}
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <Text style={[styles.messageTime, { color: item.media_type === 'sticker' ? '#fff' : timeColor }]}>{timeString}</Text>
+                    {isMyMessage && statusIcon}
+                  </View>
                 </View>
-              </View>
+              )}
             </View>
           ) : (
             <>
-          {renderMessageText(item.content, item.status === 'failed', isEmojiOnly)}
-          <View style={[styles.bubbleFooter, isEmojiOnly && { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 }]}>
-            <Text style={[styles.messageTime, { color: isEmojiOnly ? '#fff' : timeColor }]}>{timeString}</Text>
+              {renderMessageText(item.content, item.status === 'failed', isEmojiOnly)}
+              <View style={[styles.bubbleFooter, isEmojiOnly && { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 }]}>
+                <Text style={[styles.messageTime, { color: isEmojiOnly ? '#fff' : timeColor }]}>{timeString}</Text>
                 {isMyMessage && statusIcon}
               </View>
             </>
@@ -1576,32 +2036,53 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         </SwipeableMessage>
       </View>
     );
-  }, [
-    userCode,
-    myBubbleColor,
-    theirBubbleColor,
-    highlightedMessageId,
-    showBlueTicks,
-    messages,
-    revealedSpoilers,
-    pendingQueue,
-    replyingTo,
-    SCREEN_WIDTH,
-    IMAGE_SIZE,
-    favoriteGifs,
-  ]);
+  }, [userCode, myBubbleColor, theirBubbleColor, highlightedMessageId, showBlueTicks, messages, revealedSpoilers, pendingQueue, replyingTo, SCREEN_WIDTH, IMAGE_SIZE, favoriteGifs, currentlyPlaying, playbackStatus]);
 
-  const extraDataKey = renderKey + '|' + showBlueTicks + '|' + highlightedMessageId + '|' + messages.map(m => `${m.id}-${m.read_at}-${JSON.stringify(m.reacoes)}`).join('|');
+
+  const extraDataKey = renderKey + '|' + showBlueTicks + '|' + highlightedMessageId + '|' + currentlyPlaying + '|' + (playbackStatus?.positionMillis || 0) + '|' + (playbackStatus?.isPlaying ? '1' : '0') + '|' + messages.map(m => `${m.id}-${m.read_at}-${JSON.stringify(m.reacoes)}`).join('|');
+
+  // 🚀 LÓGICA DE NAVEGAÇÃO DE MÍDIA EM TELA CHEIA
+  const navigateFullscreenMedia = (direction) => {
+    const newIndex = fullscreenMediaIndex + direction;
+    if (newIndex >= 0 && newIndex < fullscreenMediaList.length) {
+      setFullscreenMediaIndex(newIndex);
+      const newItem = fullscreenMediaList[newIndex];
+      if (newItem.media_type?.startsWith('video')) {
+        setFullscreenVideo(newItem.media_url);
+        setFullscreenImage(null); // Garante que apenas um esteja ativo
+      } else {
+        setFullscreenImage(newItem.media_url);
+        setFullscreenVideo(null); // Garante que apenas um esteja ativo
+      }
+    }
+  };
+
+  // 🚀 EFEITO PARA RESETAR O PLAYER DE VÍDEO AO MUDAR DE MÍDIA
+  const fullscreenVideoPlayerRef = useRef(null);
+  useEffect(() => {
+    // Se o player de vídeo estiver ativo e o índice da mídia mudar, descarrega o vídeo anterior
+    if (fullscreenVideoPlayerRef.current && fullscreenVideo) {
+      fullscreenVideoPlayerRef.current.unloadAsync().catch(() => {});
+    }
+  }, [fullscreenMediaIndex, fullscreenVideo]); // Reset player when index or video URL changes
+
+  // Determine current media URL and type for fullscreen view
+  const currentFullscreenMedia = fullscreenMediaList[fullscreenMediaIndex];
+  const currentFullscreenMediaUrl = currentFullscreenMedia?.media_url;
+  const currentFullscreenMediaType = currentFullscreenMedia?.media_type;
+
+  const showPrevButton = fullscreenMediaIndex > 0;
+  const showNextButton = fullscreenMediaIndex < fullscreenMediaList.length - 1;
 
   return (
     <SafeAreaView style={styles.mainContainer}>
       <StatusBar barStyle="light-content" backgroundColor="#0d0d0d" />
-      <KeyboardAvoidingView 
-        style={{ flex: 1 }} 
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
         behavior="padding"
         keyboardVerticalOffset={Platform.OS === 'android' ? (StatusBar.currentHeight ?? 0) + 10 : 0}
       >
-        
+
         <View style={styles.chatHeader}>
           <TouchableOpacity onPress={onBack} style={styles.backBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
             <Ionicons name="chevron-back" size={24} color="#00ff66" />
@@ -1635,9 +2116,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           </TouchableOpacity>
         )}
 
-        <ImageBackground 
-          source={chatBackground ? { uri: chatBackground } : null} 
-          style={{ flex: 1, backgroundColor: '#050505', position: 'relative' }} 
+        <ImageBackground
+          source={chatBackground ? { uri: chatBackground } : null}
+          style={{ flex: 1, backgroundColor: '#050505', position: 'relative' }}
           imageStyle={{ opacity: 0.35 }}
         >
           {loading ? (
@@ -1650,7 +2131,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               renderItem={renderItem}
               extraData={extraDataKey}
               inverted
-              contentContainerStyle={[styles.messagesList, { paddingHorizontal: SCREEN_WIDTH < 360 ? 8 : 12 }]} 
+              contentContainerStyle={[styles.messagesList, { paddingHorizontal: SCREEN_WIDTH < 360 ? 8 : 12 }]}
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={false}
               onScroll={handleScroll}
@@ -1663,8 +2144,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             />
           )}
           {showScrollToBottom && (
-            <TouchableOpacity 
-              style={styles.scrollToBottomBtn} 
+            <TouchableOpacity
+              style={styles.scrollToBottomBtn}
               onPress={() => {
                 try {
                   flatListRef.current?.scrollToIndex({ index: 0, animated: true });
@@ -1676,7 +2157,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           )}
         </ImageBackground>
 
-        {/* 🚀 NOVO: Janela de Sugestão de Stickers por Emoji */}
+        {/* 🚀 Janela de Sugestão de Stickers por Emoji */}
         {showEmojiSuggestions && (
           <View style={styles.suggestionContainer}>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 10 }}>
@@ -1712,16 +2193,72 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
         <View style={[styles.inputWrapper, { backgroundColor: '#0d0d0d' }]}>
           <View style={styles.inputContainer}>
-            <TouchableOpacity onPress={() => setAttachMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-              <Ionicons name="attach-outline" size={24} color="#64748B" />
-            </TouchableOpacity>
-            <View style={styles.textInputContainer}>
-              <TextInput ref={textInputRef} style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
-              <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={styles.giphyBtnInside} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-                <Ionicons name="happy-outline" size={26} color="#64748B" />
+            {!recordedPreview && (
+              <TouchableOpacity onPress={() => setAttachMenuVisible(true)} style={styles.attachBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                <Ionicons name="attach-outline" size={24} color="#64748B" />
               </TouchableOpacity>
-            </View>
-            <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
+            )}
+            {recordedPreview ? (
+              <View style={styles.audioPreviewBar}>
+                <TouchableOpacity onPress={handleDeleteRecordedPreview} style={styles.previewDeleteBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Ionicons name="trash-outline" size={22} color="#ef4444" />
+                </TouchableOpacity>
+
+                <TouchableOpacity onPress={togglePreviewPlayback} style={styles.previewPlayBtn}>
+                  <Ionicons name={isPreviewPlaying ? 'pause' : 'play'} size={18} color="#000" />
+                </TouchableOpacity>
+
+                <View style={styles.previewSliderContainer}>
+                  <Slider
+                    style={{ flex: 1 }}
+                    minimumValue={0}
+                    maximumValue={1}
+                    value={previewStatus?.durationMillis ? previewStatus.positionMillis / previewStatus.durationMillis : 0}
+                    minimumTrackTintColor="#00ff66"
+                    maximumTrackTintColor="#64748B"
+                    thumbTintColor="#fff"
+                    onSlidingComplete={seekPreviewAudio}
+                  />
+                  <Text style={styles.previewDurationText}>
+                    {previewStatus?.positionMillis
+                      ? `${Math.floor(previewStatus.positionMillis / 60000)}:${String(Math.floor((previewStatus.positionMillis % 60000) / 1000)).padStart(2, '0')}`
+                      : recordedPreview.duration}
+                  </Text>
+                </View>
+              </View>
+            ) : isRecording ? (
+              <View style={styles.recordingIndicator}>
+                <TouchableOpacity onPress={handleCancelRecording} style={styles.previewDeleteBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Ionicons name="trash-outline" size={22} color="#ef4444" />
+                </TouchableOpacity>
+
+                <TouchableOpacity onPress={isPaused ? handleResumeRecording : handlePauseRecording} style={styles.previewPlayBtn}>
+                  <Ionicons name={isPaused ? 'mic' : 'pause'} size={16} color="#000" />
+                </TouchableOpacity>
+
+                <View style={styles.recordingInfoContainer}>
+                  {!isPaused && <View style={styles.recordingDot} />}
+                  <Text style={styles.recordingTimer}>{Math.floor(recordingDuration / 60)}:{(recordingDuration % 60).toString().padStart(2, '0')}</Text>
+                  <Text style={styles.recordingSlideText}>{isPaused ? 'Pausado' : 'Gravando...'}</Text>
+                </View>
+              </View>
+            ) : (
+              <View style={styles.textInputContainer}>
+                <TextInput ref={textInputRef} style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
+                <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={styles.giphyBtnInside} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+                  <Ionicons name="happy-outline" size={26} color="#64748B" />
+                </TouchableOpacity>
+              </View>
+            )}
+            {recordedPreview ? (
+              <TouchableOpacity style={styles.sendBtn} onPress={handleSendRecordedPreview}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
+            ) : inputText.trim().length > 0 ? (
+              <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
+            ) : isRecording ? (
+              <TouchableOpacity style={styles.sendBtn} onPress={stopRecording}><Ionicons name="checkmark" size={22} color="#000" /></TouchableOpacity>
+            ) : (
+              <TouchableOpacity style={styles.sendBtn} onPress={startRecording}><Ionicons name="mic" size={22} color="#000" /></TouchableOpacity>
+            )}
           </View>
         </View>
       </KeyboardAvoidingView>
@@ -1805,7 +2342,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <TouchableOpacity onPress={() => { setReactionTargetMessage(null); setShowCustomEmojiInput(false); }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
               <Ionicons name="arrow-back" size={24} color="#fff" />
             </TouchableOpacity>
-            
+
             <View style={styles.contextualActions}>
               {reactionTargetMessage && (
                 <TouchableOpacity onPress={() => handlePinMessage(reactionTargetMessage)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} style={!reactionTargetMessage.media_url ? { marginRight: 20 } : {}}>
@@ -1845,7 +2382,24 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       {!!fullscreenImage && (
         <View style={[styles.fullscreenOverlay, { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 9999, elevation: 9999 }]}>
           <TouchableOpacity style={styles.closeFullscreenBtn} onPress={() => setFullscreenImage(null)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
-          {fullscreenImage && <Image source={{ uri: fullscreenImage }} style={styles.fullscreenImage} resizeMode="contain" />}
+          {showPrevButton && (
+            <TouchableOpacity style={[styles.fullscreenNavBtn, styles.fullscreenNavBtnLeft]} onPress={() => navigateFullscreenMedia(-1)}>
+              <Ionicons name="chevron-back" size={32} color="#fff" />
+            </TouchableOpacity>
+          )}
+          <Image
+            source={{ uri: currentFullscreenMediaUrl || fullscreenImage }}
+            style={styles.fullscreenImage}
+            resizeMode="contain"
+          />
+          <TouchableOpacity style={styles.downloadFullscreenBtn} onPress={() => handleDownloadMedia(currentFullscreenMediaUrl || fullscreenImage, 'image')}>
+            <Ionicons name="download" size={22} color="#fff" />
+          </TouchableOpacity>
+          {showNextButton && (
+            <TouchableOpacity style={[styles.fullscreenNavBtn, styles.fullscreenNavBtnRight]} onPress={() => navigateFullscreenMedia(1)}>
+              <Ionicons name="chevron-forward" size={32} color="#fff" />
+            </TouchableOpacity>
+          )}
         </View>
       )}
 
@@ -1853,33 +2407,49 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       {!!fullscreenVideo && (
         <View style={[styles.fullscreenOverlay, { position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, zIndex: 9999, elevation: 9999 }]}>
           <TouchableOpacity style={styles.closeFullscreenBtn} onPress={() => setFullscreenVideo(null)}><Ionicons name="close" size={28} color="#fff" /></TouchableOpacity>
-          {fullscreenVideo && (
-            <Video
-              style={styles.fullscreenImage}
-              source={{ uri: fullscreenVideo }}
-              useNativeControls
-              resizeMode={ResizeMode.CONTAIN}
-              shouldPlay
-            />
+          {showPrevButton && (
+            <TouchableOpacity style={[styles.fullscreenNavBtn, styles.fullscreenNavBtnLeft]} onPress={() => navigateFullscreenMedia(-1)}>
+              <Ionicons name="chevron-back" size={32} color="#fff" />
+            </TouchableOpacity>
+          )}
+          <Video
+            ref={fullscreenVideoPlayerRef}
+            style={styles.fullscreenImage}
+            source={{ uri: currentFullscreenMediaUrl || fullscreenVideo }}
+            useNativeControls
+            resizeMode={ResizeMode.CONTAIN}
+            shouldPlay
+          />
+          {showNextButton && (
+            <TouchableOpacity style={[styles.fullscreenNavBtn, styles.fullscreenNavBtnRight]} onPress={() => navigateFullscreenMedia(1)}>
+              <Ionicons name="chevron-forward" size={32} color="#fff" />
+            </TouchableOpacity>
           )}
         </View>
       )}
 
-      {/* MODAL 6: Mídias do Chat */}
+      {/* MODAL 6: Mídias do Chat (estilo WhatsApp) */}
       <Modal animationType="slide" transparent visible={mediaGalleryVisible} onRequestClose={() => setMediaGalleryVisible(false)}>
         <SafeAreaView style={[styles.mainContainer, { paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0 }]}>
           <View style={[styles.chatHeader, { borderBottomWidth: 1, borderColor: '#111' }]}>
-            <TouchableOpacity onPress={() => setMediaGalleryVisible(false)}><Ionicons name="close" size={26} color="#00ff66" /></TouchableOpacity>
-            <Text style={styles.friendName}>Mídias Compartilhadas</Text>
+            <TouchableOpacity onPress={() => setMediaGalleryVisible(false)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <Ionicons name="close" size={26} color="#00ff66" />
+            </TouchableOpacity>
+            <View style={{ marginLeft: 12 }}>
+              <Text style={styles.friendName}>Mídias Compartilhadas</Text>
+              <Text style={styles.friendStatus}>
+                {messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video'))).length} arquivos
+              </Text>
+            </View>
           </View>
           <FlatList
-            data={messages.filter(m => m.media_url)}
+            data={messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')))}
             keyExtractor={(item) => String(item.id)}
             numColumns={3}
             contentContainerStyle={{ padding: 4 }}
             renderItem={({ item }) => (
-              <TouchableOpacity style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => item.media_type === 'video' ? setFullscreenVideo(item.media_url) : setFullscreenImage(item.media_url)}>
-                {item.media_type === 'video' ? (
+              <TouchableOpacity activeOpacity={0.8} style={{ flex: 1/3, aspectRatio: 1, padding: 2 }} onPress={() => handleOpenMediaFromGallery(item)}>
+                {item.media_type?.startsWith('video') ? (
                   <View style={{ width: '100%', height: '100%', borderRadius: 4, backgroundColor: '#1E293B', overflow: 'hidden', justifyContent: 'center', alignItems: 'center' }}>
                     <Video source={{ uri: item.media_url }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted={true} />
                     <View style={{ position: 'absolute', backgroundColor: 'rgba(0,0,0,0.4)', borderRadius: 14 }}><Ionicons name="play" size={28} color="#fff" /></View>
@@ -1903,15 +2473,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <Text style={styles.modalTitle}>Paleta de Cores</Text>
 
             <Text style={styles.colorSectionTitle}>Meus Balões</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.colorRow}>
-              {['#1E293B', '#2563eb', '#16a34a', '#d97706', '#dc2626', '#9333ea', '#475569', '#0284c7'].map(c => (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.colorRow}>
+              {['#1E293B', '#2563eb', '#16a34a', '#d97706', '#dc2626', '#9333ea', '#475569', '#0284c7', '#0f766e', '#be185d', '#6d28d9', '#ca8a04', '#047857', '#1d4ed8'].map(c => (
                 <TouchableOpacity key={c} style={[styles.colorCircle, { backgroundColor: c }, myBubbleColor === c && styles.colorCircleSelected]} onPress={() => saveColor('my', c)} />
               ))}
             </ScrollView>
 
             <Text style={styles.colorSectionTitle}>Balões do Contato</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.colorRow}>
-              {['#0d0d0d', '#1e293b', '#3f3f46', '#064e3b', '#1e3a8a', '#4c1d95', '#881337', '#262626'].map(c => (
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.colorRow}>
+              {['#0d0d0d', '#1e293b', '#3f3f46', '#064e3b', '#1e3a8a', '#4c1d95', '#881337', '#262626', '#1f2937', '#374151', '#4b5563', '#6b7280', '#9ca3af', '#d1d5db'].map(c => (
                 <TouchableOpacity key={c} style={[styles.colorCircle, { backgroundColor: c }, theirBubbleColor === c && styles.colorCircleSelected]} onPress={() => saveColor('their', c)} />
               ))}
             </ScrollView>
@@ -1926,9 +2496,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         <SafeAreaView style={[styles.mainContainer, { paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0 }]}>
           <View style={[styles.chatHeader, { borderBottomWidth: 1, borderColor: '#111' }]}>
             <TouchableOpacity onPress={() => setGiphyModalVisible(false)}><Ionicons name="close" size={26} color="#ef4444" /></TouchableOpacity>
-            <TextInput 
-              style={{ flex: 1, marginLeft: 15, marginRight: 10, color: '#fff', fontSize: 16, backgroundColor: '#111827', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 20 }} 
-              placeholder="Pesquisar stickers..." 
+            <TextInput
+              style={{ flex: 1, marginLeft: 15, marginRight: 10, color: '#fff', fontSize: 16, backgroundColor: '#111827', paddingHorizontal: 15, paddingVertical: 8, borderRadius: 20 }}
+              placeholder="Pesquisar stickers..."
               placeholderTextColor="#64748B"
               value={giphySearch}
               onChangeText={(t) => { setGiphySearch(t); if (giphyTab !== 'search') setGiphyTab('search'); }}
@@ -1948,14 +2518,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           </View>
 
           {giphyTab === 'recent' ? (
-            <FlatList 
-              data={recentGifs} 
-              keyExtractor={(item, index) => `recent-${item}-${index}`} 
-              numColumns={3} 
+            <FlatList
+              data={recentGifs}
+              keyExtractor={(item, index) => `recent-${item}-${index}`}
+              numColumns={3}
               contentContainerStyle={{ padding: 4 }}
               renderItem={({ item }) => (
-                <TouchableOpacity 
-                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                <TouchableOpacity
+                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }}
                   onPress={() => handleSendSticker(item)}
                   onLongPress={() => handleToggleFavoriteGif(item)}
                   delayLongPress={800}
@@ -1968,14 +2538,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               )}
             />
           ) : giphyTab === 'favorites' ? (
-            <FlatList 
-              data={favoriteGifs} 
-              keyExtractor={(item, index) => `favorite-${item}-${index}`} 
-              numColumns={3} 
+            <FlatList
+              data={favoriteGifs}
+              keyExtractor={(item, index) => `favorite-${item}-${index}`}
+              numColumns={3}
               contentContainerStyle={{ padding: 4 }}
               renderItem={({ item }) => (
-                <TouchableOpacity 
-                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                <TouchableOpacity
+                  style={{ flex: 1/3, aspectRatio: 1, padding: 4 }}
                   onPress={() => handleSendSticker(item)}
                   onLongPress={() => handleToggleFavoriteGif(item)}
                   delayLongPress={800}
@@ -1993,16 +2563,16 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           ) : isSearchingGiphy ? (
               <ActivityIndicator size="large" color="#00ff66" style={{ flex: 1, marginTop: 50 }} />
             ) : (
-              <FlatList 
-                data={giphyResults} 
-                keyExtractor={(item, index) => `${item.id}-${index}`} 
-                numColumns={3} 
+              <FlatList
+                data={giphyResults}
+                keyExtractor={(item, index) => `${item.id}-${index}`}
+                numColumns={3}
                 contentContainerStyle={{ padding: 4 }}
                 onEndReached={() => fetchGiphy(false)}
                 onEndReachedThreshold={0.5}
                 renderItem={({ item }) => (
-                  <TouchableOpacity 
-                    style={{ flex: 1/3, aspectRatio: 1, padding: 4 }} 
+                  <TouchableOpacity
+                    style={{ flex: 1/3, aspectRatio: 1, padding: 4 }}
                     onPress={() => handleSendSticker(`https://media2.giphy.com/media/${item.id}/200.gif`)}
                     onLongPress={() => handleToggleFavoriteGif(`https://media2.giphy.com/media/${item.id}/200.gif`)}
                     delayLongPress={800}
@@ -2036,7 +2606,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                     if (searchTerm.length >= 3) {
                       return (
                         <View style={styles.giphyEmptyState}>
-                          <Ionicons name="search-outline" size={48} color="#475569" /> 
+                          <Ionicons name="search-outline" size={48} color="#475569" />
                           <Text style={styles.giphyEmptyTitle}>Nenhum resultado</Text>
                           <Text style={styles.giphyEmptySubtitle}>Não encontramos figurinhas para "{searchTerm}".</Text>
                         </View>
@@ -2053,7 +2623,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       </Modal>
 
       {/* MODAL 10: Ações do Sticker (Estilo WhatsApp) */}
-      <Modal animationType="fade" transparent visible={stickerActionModalVisible} onRequestClose={() => setStickerActionModalVisible(false)}> 
+      <Modal animationType="fade" transparent visible={stickerActionModalVisible} onRequestClose={() => setStickerActionModalVisible(false)}>
         <TouchableOpacity style={styles.modalOverlayDark} activeOpacity={1} onPress={() => setStickerActionModalVisible(false)}>
           <TouchableOpacity activeOpacity={1} style={styles.stickerActionCard}>
             {selectedSticker?.url && (
@@ -2075,7 +2645,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         </TouchableOpacity>
       </Modal>
     </SafeAreaView>
-  ); 
+  );
 }
 
 const styles = StyleSheet.create({
@@ -2083,7 +2653,7 @@ const styles = StyleSheet.create({
   chatHeader: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 15, paddingVertical: 10, backgroundColor: '#0d0d0d', borderBottomWidth: 1, borderBottomColor: '#111', minHeight: 65 },
   backBtn: { paddingRight: 12 },
   menuBtn: { padding: 5 },
-  headerInfo: { flex: 1, minWidth: 0, justifyContent: 'center' }, 
+  headerInfo: { flex: 1, minWidth: 0, justifyContent: 'center' },
   friendName: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   friendStatus: { color: '#64748B', fontSize: 11, marginTop: 2 },
   messagesList: { paddingVertical: 18 },
@@ -2153,10 +2723,24 @@ const styles = StyleSheet.create({
   fullscreenImage: { width: '100%', height: '100%' },
   closeFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 20, zIndex: 99, elevation: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 },
   downloadFullscreenBtn: { position: 'absolute', top: Platform.OS === 'android' ? 40 : 50, right: 80, zIndex: 99, elevation: 99, padding: 8, backgroundColor: 'rgba(0,0,0,0.5)', borderRadius: 20 },
+  fullscreenNavBtn: {
+    position: 'absolute',
+    top: '50%',
+    marginTop: -25, // Metade da altura para centralizar verticalmente
+    width: 50,
+    height: 50,
+    borderRadius: 25,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    zIndex: 100, // Acima da imagem/vídeo
+  },
+  fullscreenNavBtnLeft: { left: 10 },
+  fullscreenNavBtnRight: { right: 10 },
   downloadBtn: { position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.5)', padding: 6, borderRadius: 16, zIndex: 10, elevation: 10 },
   colorSectionTitle: { color: '#64748B', fontSize: 13, fontWeight: 'bold', marginTop: 15, marginBottom: 10, textTransform: 'uppercase' },
   colorRow: { flexDirection: 'row', marginBottom: 5 },
-  colorCircle: { width: 40, height: 40, borderRadius: 20, marginRight: 12, borderWidth: 2, borderColor: '#1F2937' },
+  colorCircle: { width: 40, height: 40, borderRadius: 20, marginRight: 12, borderWidth: 2, borderColor: '#1F2937', justifyContent: 'center', alignItems: 'center' },
   colorCircleSelected: { borderColor: '#00ff66' },
   linkPreviewContainer: { backgroundColor: '#111827', borderRadius: 8, marginTop: 8, overflow: 'hidden', borderWidth: 1, borderColor: '#1F2937' },
   linkPreviewImage: { width: '100%', height: 120, backgroundColor: '#1e293b' },
@@ -2225,4 +2809,81 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginTop: 4,
   },
+  // 🚀 BALÃO DE ÁUDIO — visual estilo WhatsApp (botão circular verde + "forma de onda")
+  audioBubble: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 4,
+  },
+  audioPlayCircle: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#00ff66',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 10,
+  },
+  audioContentContainer: {
+    flex: 1,
+    justifyContent: 'center',
+  },
+  waveformContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 24,
+    gap: 3,
+  },
+  waveformBar: {
+    width: 3,
+    borderRadius: 2,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+  },
+  audioFooter: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  audioDurationText: {
+    color: '#94a3b8',
+    fontSize: 11,
+    fontFamily: 'monospace',
+  },
+  audioPreviewBar: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 42,
+    backgroundColor: '#111827',
+    borderRadius: 22,
+    paddingHorizontal: 10,
+    marginRight: 10,
+  },
+  previewDeleteBtn: { padding: 6, marginRight: 4 },
+  previewPlayBtn: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#00ff66',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 8,
+  },
+  previewSliderContainer: { flex: 1, flexDirection: 'row', alignItems: 'center' },
+  previewDurationText: { color: '#94a3b8', fontSize: 11, fontFamily: 'monospace', marginLeft: 6, minWidth: 34 },
+  recordingIndicator: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 42,
+    backgroundColor: '#111827',
+    borderRadius: 22,
+    paddingHorizontal: 10,
+    marginRight: 10,
+  },
+  recordingInfoContainer: { flexDirection: 'row', alignItems: 'center', flex: 1, marginLeft: 4 },
+  recordingDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#ef4444', marginRight: 8 },
+  recordingTimer: { color: '#f1f5f9', fontFamily: 'monospace', fontSize: 15 },
+  recordingSlideText: { color: '#64748B', marginLeft: 'auto', fontSize: 13 },
 });
