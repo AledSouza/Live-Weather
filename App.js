@@ -7,14 +7,19 @@ import { supabase } from './supabase';
 import { Ionicons } from '@expo/vector-icons';
 import { registerForPushNotificationsAsync } from './screens/notificationService';
 
+const GROUP_PREFIX = 'group:';
+const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
+
 // Telas do ecossistema
 import WeatherScreen from './screens/WeatherScreen';
 import ChatListScreen from './screens/ChatListScreen';
 import ChatRoomScreen from './screens/ChatRoomScreen';
+import { ToastProvider, useToast } from './components/Toast';
 
-export default function App() {
+function AppShell() {
   const inactivityTimer = useRef(null);
   const isPickerActiveRef = useRef(false);
+  const toast = useToast();
   const [isChatMode, setIsChatMode] = useState(false);
   const [currentScreen, setCurrentScreen] = useState('gateway'); // 'gateway', 'list', 'room'
   const [nickname, setNickname] = useState('');
@@ -146,6 +151,20 @@ export default function App() {
           }
         });
       }
+      const { data: myGroupLinks } = await supabase.from('grupo_membros').select('group_id').eq('member_code', myCleanCode);
+      const myGroupIds = (myGroupLinks || []).map(g => g.group_id);
+      const myGroupTokens = myGroupIds.map(getGroupToken);
+      if (myGroupTokens.length > 0) {
+        const { data: groupMsgs } = await supabase.from('mensagens')
+          .select('media_url')
+          .in('receiver_code', myGroupTokens);
+        (groupMsgs || []).forEach(m => {
+          if (m.media_url && !m.media_url.includes('giphy.com')) {
+            const path = extractStoragePath(m.media_url);
+            if (path) filesToDelete.push(path);
+          }
+        });
+      }
       if (filesToDelete.length > 0) {
         const { error: storageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
         if (storageError) console.error('Erro ao deletar mídias:', storageError);
@@ -156,6 +175,21 @@ export default function App() {
 
       // 2. Apaga definitivamente todas as mensagens (limpa o chat)
       await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+      if (myGroupTokens.length > 0) {
+        await supabase.from('mensagens').delete().in('receiver_code', myGroupTokens);
+        await supabase.from('pins').delete().in('room_key', myGroupTokens);
+        await supabase.from('grupo_membros').delete().eq('member_code', myCleanCode);
+      }
+      const { data: ownedGroups } = await supabase.from('grupos').select('id, photo_url').eq('created_by', myCleanCode);
+      const ownedGroupFiles = (ownedGroups || [])
+        .map(g => g.photo_url)
+        .filter(Boolean)
+        .map(extractStoragePath)
+        .filter(Boolean);
+      if (ownedGroupFiles.length > 0) {
+        await supabase.storage.from('chat-media').remove(ownedGroupFiles);
+      }
+      await supabase.from('grupos').delete().eq('created_by', myCleanCode);
 
       // 3. Renomeia todos os canais (mantendo-os na lista)
       await supabase.from('conexoes').update({ friend_name: '####' }).eq('user_code', myCleanCode);
@@ -209,7 +243,7 @@ export default function App() {
     if (pinMode === 'setup' || pinMode === 'redefine') {
       await AsyncStorage.setItem('@saved_pin', val);
       setSavedPin(val);
-      alert(pinMode === 'setup' ? 'PIN configurado com sucesso!' : 'PIN redefinido com sucesso!');
+      toast(pinMode === 'setup' ? 'PIN configurado com sucesso!' : 'PIN redefinido com sucesso!');
       setShowPinPad(false);
       setPinValue('');
       if (pinMode === 'setup') setIsChatMode(true);
@@ -261,7 +295,7 @@ export default function App() {
         .insert([novoPerfil]);
 
       if (error) {
-        alert('Falha no Supabase: ' + error.message);
+        toast('Falha no Supabase: ' + error.message, { tone: 'error' });
         console.error('Erro detalhado:', error);
         setSyncing(false);
         return;
@@ -301,6 +335,7 @@ export default function App() {
             onBack={() => setIsChatMode(false)} 
             userCode={connectionCode} 
             userNickname={nickname}
+            setPickerActive={(val) => { isPickerActiveRef.current = val; }}
             onOpenChat={(code, name) => {
               setActiveFriendCode(code);
               setActiveFriendName(name);
@@ -389,6 +424,14 @@ export default function App() {
         </View>
       )}
     </View>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <AppShell />
+    </ToastProvider>
   );
 }
 

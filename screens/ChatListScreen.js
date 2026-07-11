@@ -1,10 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextInput, Modal, ActivityIndicator, Alert } from 'react-native';
+import { View, Text, StyleSheet, FlatList, TouchableOpacity, SafeAreaView, TextInput, Modal, ActivityIndicator, Alert, Image, ScrollView } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Clipboard from 'expo-clipboard';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { supabase } from '../supabase';
 import { registerForPushNotificationsAsync } from './notificationService';
+import { useToast } from '../components/Toast';
+
+const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
+const GROUP_PREFIX = 'group:';
+const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
+const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
 
 // ✅ Extrai o path real do arquivo relativo ao bucket
 const extractStoragePath = (url) => {
@@ -18,17 +26,23 @@ const extractStoragePath = (url) => {
   }
 };
 
-export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat }) {
+export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat, setPickerActive }) {
+  const toast = useToast();
   const [modalVisible, setModalVisible] = useState(false);
+  const [groupModalVisible, setGroupModalVisible] = useState(false);
   const [editModalVisible, setEditModalVisible] = useState(false);
   const [newFriendCode, setNewFriendCode] = useState('');
   const [newFriendName, setNewFriendName] = useState('');
+  const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupPhoto, setNewGroupPhoto] = useState(null);
+  const [selectedGroupContacts, setSelectedGroupContacts] = useState([]);
   
   const [selectedChat, setSelectedChat] = useState(null);
   const [editedName, setEditedName] = useState('');
 
   const [chats, setChats] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
   const [adding, setAdding] = useState(false);
 
   // 🚀 NOVOS ESTADOS: Gerenciamento de Canais Fixados
@@ -54,11 +68,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       if (currentMode === 'true') {
         await AsyncStorage.setItem('@dev_mode', 'false');
         setIsDevMode(false);
-        alert("Modo desenvolvedor desativado.");
+        toast("Modo desenvolvedor desativado.");
       } else {
         await AsyncStorage.setItem('@dev_mode', 'true');
         setIsDevMode(true);
-        alert("Modo desenvolvedor ativado!");
+        toast("Modo desenvolvedor ativado!");
       }
       devClicksRef.current = 0;
     }
@@ -106,11 +120,30 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               await supabase.from('mensagens').delete().eq('sender_code', myCode);
               await supabase.from('mensagens').delete().eq('receiver_code', myCode);
 
-              alert("Mensagens e mídias limpas com sucesso!");
+              const { data: myGroupLinks } = await supabase.from('grupo_membros').select('group_id').eq('member_code', myCode);
+              const myGroupIds = (myGroupLinks || []).map(g => g.group_id);
+              const myGroupTokens = myGroupIds.map(getGroupToken);
+              if (myGroupTokens.length > 0) {
+                await supabase.from('mensagens').delete().in('receiver_code', myGroupTokens);
+                await supabase.from('pins').delete().in('room_key', myGroupTokens);
+                await supabase.from('grupo_membros').delete().eq('member_code', myCode);
+              }
+              const { data: ownedGroups } = await supabase.from('grupos').select('id, photo_url').eq('created_by', myCode);
+              const ownedGroupFiles = (ownedGroups || [])
+                .map(g => g.photo_url)
+                .filter(Boolean)
+                .map(extractStoragePath)
+                .filter(Boolean);
+              if (ownedGroupFiles.length > 0) {
+                await supabase.storage.from('chat-media').remove(ownedGroupFiles);
+              }
+              await supabase.from('grupos').delete().eq('created_by', myCode);
+
+              toast("Mensagens e mídias limpas com sucesso!");
               fetchMyConversations();
             } catch (e) {
               console.error(e);
-              alert("Erro ao limpar dados do servidor.");
+              toast("Erro ao limpar dados do servidor.", { tone: 'error' });
             } finally { setLoading(false); }
           }
         }
@@ -144,13 +177,13 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     const newVal = !pinEnabled;
     setPinEnabled(newVal);
     await AsyncStorage.setItem('@pin_enabled', newVal ? 'true' : 'false');
-    if (newVal) alert('Segurança PIN ativada! Ao abrir o chat, você precisará configurar/digitar seu PIN de 3 dígitos. Cuidado: 3 erros = Limpeza Total (Modo Pânico).');
-    else alert('Segurança PIN desativada.');
+    if (newVal) toast('Segurança PIN ativada! Ao abrir o chat, você precisará configurar/digitar seu PIN de 3 dígitos. Cuidado: 3 erros = Limpeza Total (Modo Pânico).');
+    else toast('Segurança PIN desativada.');
   };
 
   // 🚀 LÓGICA DE TESTE DO PROTOCOLO PÂNICO (Acionado segurando o cadeado)
   const handlePanicTest = async () => {
-    alert('TESTE DO PÂNICO INICIADO: Aplicando protocolo de ofuscação...');
+    toast('TESTE DO PÂNICO INICIADO: Aplicando protocolo de ofuscação...');
     setLoading(true);
     try {
       const myCleanCode = userCode.trim().toLowerCase();
@@ -180,8 +213,42 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       const { data: myConns } = await supabase.from('conexoes').select('friend_code').eq('user_code', myCleanCode);
       if (myConns) myConns.forEach(c => uniqueContacts.add(c.friend_code));
 
+      const { data: myGroupLinks } = await supabase.from('grupo_membros').select('group_id').eq('member_code', myCleanCode);
+      const myGroupIds = (myGroupLinks || []).map(g => g.group_id);
+      const myGroupTokens = myGroupIds.map(getGroupToken);
+      if (myGroupTokens.length > 0) {
+        const { data: groupMsgs } = await supabase.from('mensagens')
+          .select('media_url')
+          .in('receiver_code', myGroupTokens);
+        (groupMsgs || []).forEach(m => {
+          if (m.media_url && !m.media_url.includes('giphy.com')) {
+            const path = extractStoragePath(m.media_url);
+            if (path) filesToDelete.push(path);
+          }
+        });
+      }
+      if (filesToDelete.length > 0) {
+        const { error: groupStorageError } = await supabase.storage.from('chat-media').remove(filesToDelete);
+        if (groupStorageError) console.error('Erro ao deletar midias de grupos:', groupStorageError);
+      }
+
       // 2. Apaga definitivamente todas as mensagens (limpa o chat)
       await supabase.from('mensagens').delete().or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`);
+      if (myGroupTokens.length > 0) {
+        await supabase.from('mensagens').delete().in('receiver_code', myGroupTokens);
+        await supabase.from('pins').delete().in('room_key', myGroupTokens);
+        await supabase.from('grupo_membros').delete().eq('member_code', myCleanCode);
+      }
+      const { data: ownedGroups } = await supabase.from('grupos').select('id, photo_url').eq('created_by', myCleanCode);
+      const ownedGroupFiles = (ownedGroups || [])
+        .map(g => g.photo_url)
+        .filter(Boolean)
+        .map(extractStoragePath)
+        .filter(Boolean);
+      if (ownedGroupFiles.length > 0) {
+        await supabase.storage.from('chat-media').remove(ownedGroupFiles);
+      }
+      await supabase.from('grupos').delete().eq('created_by', myCleanCode);
 
       // 3. Renomeia todos os canais (mantendo-os na lista)
       await supabase.from('conexoes').update({ friend_name: '####' }).eq('user_code', myCleanCode);
@@ -211,11 +278,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       const cacheKeys = keys.filter(k => k.startsWith('@cache_msgs_') || k.startsWith('@queue_') || k.startsWith('@cache_chats_'));
       if (cacheKeys.length > 0) await AsyncStorage.multiRemove(cacheKeys);
 
-      alert('Teste concluído: Dados ofuscados com sucesso.');
+      toast('Teste concluído: Dados ofuscados com sucesso.');
       fetchMyConversations(); // Recarrega a lista (os canais continuarão visíveis, mas com as ofuscações)
     } catch (e) {
       console.error(e);
-      alert('Erro ao executar o teste do pânico.');
+      toast('Erro ao executar o teste do pânico.', { tone: 'error' });
     } finally { setLoading(false); }
   };
 
@@ -230,15 +297,136 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           await supabase.from('perfis').update({ onesignal_id: token }).eq('connection_code', userCode.trim().toLowerCase());
         }
       } catch (e) {}
-      alert('Notificações de Clima ATIVADAS.');
+      toast('Notificações de Clima ATIVADAS.');
     } else {
-      alert('Notificações de Clima DESATIVADAS.');
+      toast('Notificações de Clima DESATIVADAS.');
+    }
+  };
+
+  const getMessagePreview = (lastMsg, prefix = '') => {
+    if (!lastMsg) return 'Canal seguro estabelecido';
+    if (lastMsg.media_url) {
+      if (lastMsg.media_type?.includes('_spoiler')) return prefix + 'Midia com Spoiler';
+      if (lastMsg.media_type === 'audio') return prefix + 'Audio';
+      if (lastMsg.media_type === 'video') return prefix + 'Video';
+      if (lastMsg.media_type === 'document') return prefix + 'Documento';
+      if (lastMsg.media_type === 'sticker') return prefix + 'Sticker';
+      return prefix + 'Foto';
+    }
+    return prefix + (lastMsg.content || '');
+  };
+
+  const pickGroupPhoto = async () => {
+    try {
+      setPickerActive?.(true);
+      const res = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!res.granted) return toast('Permissao necessaria para acessar a galeria.');
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.75,
+      });
+      if (!result.canceled && result.assets?.[0]?.uri) {
+        setNewGroupPhoto(result.assets[0].uri);
+      }
+    } catch (err) {
+      console.error(err);
+      toast('Erro ao escolher a foto do grupo.', { tone: 'error' });
+    } finally {
+      setPickerActive?.(false);
+    }
+  };
+
+  const uploadGroupPhoto = async (uri, ownerCode) => {
+    if (!uri) return null;
+    const filename = `groups/${ownerCode}-${Date.now()}-${Math.floor(Math.random() * 1000)}.jpg`;
+    try {
+      const base64 = await FileSystem.readAsStringAsync(uri, { encoding: 'base64' });
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      const lookup = new Uint8Array(256);
+      for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+      let bufferLength = base64.length * 0.75;
+      if (base64[base64.length - 1] === '=') bufferLength--;
+      if (base64[base64.length - 2] === '=') bufferLength--;
+      const bytes = new Uint8Array(bufferLength);
+      let p = 0;
+      for (let i = 0; i < base64.length; i += 4) {
+        const encoded1 = lookup[base64.charCodeAt(i)];
+        const encoded2 = lookup[base64.charCodeAt(i + 1)];
+        const encoded3 = lookup[base64.charCodeAt(i + 2)];
+        const encoded4 = lookup[base64.charCodeAt(i + 3)];
+        bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+        if (encoded3 !== 64) bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+        if (encoded4 !== 64) bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+      }
+
+      const { error } = await supabase.storage.from('chat-media').upload(filename, bytes, {
+        contentType: 'image/jpeg',
+        upsert: false,
+      });
+      if (error) throw error;
+      return `${SUPABASE_URL}/storage/v1/object/public/chat-media/${filename}`;
+    } catch (err) {
+      console.error('Erro ao enviar foto do grupo:', err);
+      throw err;
+    }
+  };
+
+  const toggleGroupContact = (token) => {
+    setSelectedGroupContacts(prev => (
+      prev.includes(token) ? prev.filter(t => t !== token) : [...prev, token]
+    ));
+  };
+
+  const resetGroupForm = () => {
+    setNewGroupName('');
+    setNewGroupPhoto(null);
+    setSelectedGroupContacts([]);
+  };
+
+  const handleCreateGroup = async () => {
+    const myCode = userCode.trim().toLowerCase();
+    const groupName = newGroupName.trim();
+    if (!groupName) return toast('Escolha um nome para o grupo.');
+    if (selectedGroupContacts.length === 0) return toast('Selecione pelo menos um contato.');
+
+    setAdding(true);
+    try {
+      const photoUrl = await uploadGroupPhoto(newGroupPhoto, myCode);
+      const { data: group, error: groupError } = await supabase
+        .from('grupos')
+        .insert([{ name: groupName, photo_url: photoUrl, created_by: myCode }])
+        .select()
+        .single();
+      if (groupError) throw groupError;
+
+      const members = Array.from(new Set([myCode, ...selectedGroupContacts])).map(memberCode => ({
+        group_id: group.id,
+        member_code: memberCode,
+      }));
+      const { error: membersError } = await supabase.from('grupo_membros').insert(members);
+      if (membersError) throw membersError;
+
+      resetGroupForm();
+      setGroupModalVisible(false);
+      fetchMyConversations();
+      onOpenChat(getGroupToken(group.id), group.name);
+    } catch (err) {
+      console.error(err);
+      toast('Erro ao criar grupo. Verifique o SQL do Supabase.', { tone: 'error' });
+    } finally {
+      setAdding(false);
     }
   };
 
   const fetchMyConversations = async () => {
     if (!userCode) return;
     const myCleanCode = userCode.trim().toLowerCase();
+    const withTimeout = (promise, ms = 15000) => Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Tempo limite ao carregar canais')), ms)),
+    ]);
 
     // 🚀 CACHE: Carrega histórico salvo na memória para acesso instantâneo/offline
     try {
@@ -247,20 +435,43 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     } catch (e) {}
 
     try {
-      const { data: myConnections } = await supabase.from('conexoes').select('*').eq('user_code', myCleanCode);
+      const { data: myConnections, error: connectionsError } = await withTimeout(supabase.from('conexoes').select('*').eq('user_code', myCleanCode));
+      if (connectionsError) throw connectionsError;
+      const { data: myGroupLinks, error: linksError } = await withTimeout(supabase.from('grupo_membros').select('group_id').eq('member_code', myCleanCode));
+      if (linksError) throw linksError;
+      const myGroupIds = (myGroupLinks || []).map(g => g.group_id);
+      let myGroups = [];
+      if (myGroupIds.length > 0) {
+        const { data: groupRows, error: groupsError } = await withTimeout(supabase.from('grupos').select('*').in('id', myGroupIds));
+        if (groupsError) throw groupsError;
+        myGroups = groupRows || [];
+      }
+      const groupTokens = myGroupIds.map(getGroupToken);
       
       // 🚀 Extrai automaticamente os contatos fixados do banco de dados!
       const pins = myConnections?.filter(c => c.is_pinned).map(c => c.friend_code.trim().toLowerCase()) || [];
       setPinnedTokens(pins);
 
       // Busca todas as mensagens enviadas ou recebidas por você, ordenadas da mais nova para a mais velha
-      const { data: allMessages } = await supabase
+      const { data: allMessages, error: messagesError } = await withTimeout(supabase
         .from('mensagens')
         .select('sender_code, receiver_code, content, media_url, media_type, read_at, created_at')
         .or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`)
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false }));
+      if (messagesError) throw messagesError;
 
-      const messages = allMessages || [];
+      let groupMessages = [];
+      if (groupTokens.length > 0) {
+        const { data: groupMsgRows, error: groupMessagesError } = await withTimeout(supabase
+          .from('mensagens')
+          .select('sender_code, receiver_code, content, media_url, media_type, read_at, created_at')
+          .in('receiver_code', groupTokens)
+          .order('created_at', { ascending: false }));
+        if (groupMessagesError) throw groupMessagesError;
+        groupMessages = groupMsgRows || [];
+      }
+
+      const messages = [...(allMessages || []), ...groupMessages].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       const incomingMessages = messages.filter(m => m.receiver_code.trim().toLowerCase() === myCleanCode);
 
       const allContacts = new Set();
@@ -269,7 +480,8 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
       let incomingProfiles = [];
       if (allContacts.size > 0) {
-        const { data: profiles } = await supabase.from('perfis').select('connection_code, nickname, last_seen').in('connection_code', Array.from(allContacts));
+        const { data: profiles, error: profilesError } = await withTimeout(supabase.from('perfis').select('connection_code, nickname, last_seen').in('connection_code', Array.from(allContacts)));
+        if (profilesError) throw profilesError;
         incomingProfiles = profiles || [];
       }
 
@@ -325,12 +537,34 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         }
       });
 
+      myGroups.forEach(group => {
+        const groupToken = getGroupToken(group.id);
+        const groupMsgs = messages.filter(m => m.receiver_code?.trim?.().toLowerCase() === groupToken);
+        const lastMsg = groupMsgs[0];
+        const prefix = lastMsg?.sender_code?.trim?.().toLowerCase() === myCleanCode ? 'Voce: ' : '';
+        conversationMap.set(groupToken, {
+          id: group.id,
+          token: groupToken,
+          name: group.name,
+          photoUrl: group.photo_url,
+          createdBy: group.created_by,
+          lastMessage: getMessagePreview(lastMsg, prefix),
+          isConnection: false,
+          isGroup: true,
+          unread: groupMsgs.filter(m => m.sender_code?.trim?.().toLowerCase() !== myCleanCode && m.read_at === null).length
+        });
+      });
+
       const finalChats = Array.from(conversationMap.values());
       setChats(finalChats);
+      setLoadError(false);
       
       // Atualiza o cache silenciosamente
       AsyncStorage.setItem(`@cache_chats_${myCleanCode}`, JSON.stringify(finalChats)).catch(() => {});
-    } catch (err) { console.error(err); } finally { setLoading(false); }
+    } catch (err) {
+      console.error('Erro ao carregar canais:', err);
+      setLoadError(true);
+    } finally { setLoading(false); }
   };
 
   useEffect(() => {
@@ -352,10 +586,24 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
         fetchMyConversations();
       })
       .subscribe();
+
+    const channelGroups = supabase
+      .channel(`chat-list-groups-${cleanUserCode}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'grupo_membros', filter: `member_code=eq.${cleanUserCode}` }, () => {
+        fetchMyConversations();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'grupos' }, () => {
+        fetchMyConversations();
+      })
+      .subscribe();
+
+    const groupPoll = setInterval(fetchMyConversations, 5000);
       
     return () => { 
+      clearInterval(groupPoll);
       supabase.removeChannel(channelIncoming); 
       supabase.removeChannel(channelOutgoing); 
+      supabase.removeChannel(channelGroups);
     };
   }, [userCode]);
 
@@ -376,7 +624,9 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     setOptionsModalVisible(false);
 
     // 🚀 Salva a preferência direto no banco de dados na nuvem
-    await supabase.from('conexoes').update({ is_pinned: newVal }).eq('user_code', userCode.trim().toLowerCase()).eq('friend_code', token);
+    if (!isGroupToken(token)) {
+      await supabase.from('conexoes').update({ is_pinned: newVal }).eq('user_code', userCode.trim().toLowerCase()).eq('friend_code', token);
+    }
   };
 
   const handleTokenChange = (text) => {
@@ -386,14 +636,14 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   };
 
   const handleAddFriend = async () => {
-    if (newFriendCode.trim() === '' || newFriendName.trim() === '') return alert('Preencha os dados.');
+    if (newFriendCode.trim() === '' || newFriendName.trim() === '') return toast('Preencha os dados.');
     const formattedToken = newFriendCode.trim().toLowerCase();
-    if (formattedToken === userCode.trim().toLowerCase()) return alert('Operação inválida.');
+    if (formattedToken === userCode.trim().toLowerCase()) return toast('Operação inválida.');
 
     setAdding(true);
     try {
       const { data: profileCheck } = await supabase.from('perfis').select('nickname').eq('connection_code', formattedToken).single();
-      if (!profileCheck) { alert('Terminal não encontrado.'); setAdding(false); return; }
+      if (!profileCheck) { toast('Terminal não encontrado.'); setAdding(false); return; }
 
       await supabase.from('conexoes').insert([{ user_code: userCode.trim().toLowerCase(), friend_code: formattedToken, friend_name: newFriendName.trim() }]);
       setNewFriendCode(''); setNewFriendName(''); setModalVisible(false);
@@ -464,7 +714,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               // Deleta todos os registros onde connection_code não é nulo (ou seja, apaga tudo)
               await supabase.from('logs_acesso').delete().not('connection_code', 'is', null);
               setSeenHistoryData([]);
-              alert("Histórico global apagado com sucesso.");
+              toast("Histórico global apagado com sucesso.");
             } catch (e) { console.error(e); }
           }
         }
@@ -512,6 +762,22 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
                 const friendCode = chatOptionTarget.token;
                 const myCode = userCode.trim().toLowerCase();
 
+                if (isGroupToken(friendCode)) {
+                  const groupId = friendCode.replace(GROUP_PREFIX, '');
+                  await supabase.from('grupo_membros').delete().match({ group_id: groupId, member_code: myCode });
+                  await supabase.from('pins').delete().eq('room_key', friendCode);
+                  if (chatOptionTarget.createdBy === myCode) {
+                    if (chatOptionTarget.photoUrl) {
+                      const photoPath = extractStoragePath(chatOptionTarget.photoUrl);
+                      if (photoPath) await supabase.storage.from('chat-media').remove([photoPath]);
+                    }
+                    await supabase.from('mensagens').delete().eq('receiver_code', friendCode);
+                    await supabase.from('grupos').delete().eq('id', groupId);
+                  }
+                  setChatOptionTarget(null);
+                  fetchMyConversations();
+                  return;
+                }
                 // ─── Remove a conexão APENAS na sua direção ───
                 const { error: conn1 } = await supabase.from('conexoes').delete().match({ user_code: myCode, friend_code: friendCode });
                 if (conn1) console.error('Erro conexão dir. 1:', conn1);
@@ -525,7 +791,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
                 setChatOptionTarget(null);
                 fetchMyConversations();
-              } catch (err) { console.error(err); alert("Erro ao excluir canal."); } finally { setAdding(false); }
+              } catch (err) { console.error(err); toast("Erro ao excluir canal.", { tone: 'error' }); } finally { setAdding(false); }
             }
           }
         ]
@@ -537,6 +803,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   const processedChats = chats
     .map(c => ({ ...c, isPinned: pinnedTokens.includes(c.token) }))
     .sort((a, b) => (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0));
+  const groupContactOptions = chats.filter(c => !isGroupToken(c.token));
 
   return (
     <SafeAreaView style={styles.container}>
@@ -549,7 +816,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
             <Text style={styles.myNickname}>{userNickname}</Text>
             <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 2 }}>
               <Text style={[styles.myCode, { marginTop: 0 }]}>Token: {userCode}</Text>
-              <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} onPress={() => { Clipboard.setStringAsync(userCode); alert('Token copiado!'); }} style={{ marginLeft: 8 }}>
+              <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} onPress={() => { Clipboard.setStringAsync(userCode); toast('Token copiado!'); }} style={{ marginLeft: 8 }}>
                 <Ionicons name="copy-outline" size={16} color="#64748B" />
               </TouchableOpacity>
             </View>
@@ -570,6 +837,13 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
       {loading ? (
         <ActivityIndicator size="large" color="#00ff66" style={{ flex: 1 }} />
+      ) : loadError ? (
+        <View style={styles.emptyContainer}>
+          <Text style={styles.emptyText}>Nao foi possivel carregar os canais.</Text>
+          <TouchableOpacity style={styles.retryButton} onPress={() => { setLoading(true); fetchMyConversations(); }}>
+            <Text style={styles.retryButtonText}>Tentar novamente</Text>
+          </TouchableOpacity>
+        </View>
       ) : processedChats.length === 0 ? (
         <View style={styles.emptyContainer}><Text style={styles.emptyText}>Nenhum canal ativo.</Text></View>
       ) : (
@@ -577,6 +851,8 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           data={processedChats}
           keyExtractor={(item) => item.token}
           contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 100 }}
+          onRefresh={() => { setLoading(true); fetchMyConversations(); }}
+          refreshing={false}
           renderItem={({ item }) => (
             <TouchableOpacity 
               style={styles.chatCard} 
@@ -589,7 +865,11 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
                 activeOpacity={0.8}
                 onPress={() => onOpenChat(item.token, item.name)}
               >
-                <Ionicons name={item.isPinned ? "pin" : "person-outline"} size={20} color="#00ff66" style={item.isPinned && { transform: [{ rotate: '45deg' }] }} />
+                {item.photoUrl ? (
+                  <Image source={{ uri: item.photoUrl }} style={styles.avatarImage} />
+                ) : (
+                  <Ionicons name={item.isPinned ? "pin" : (item.isGroup ? "people-outline" : "person-outline")} size={20} color="#00ff66" style={item.isPinned && { transform: [{ rotate: '45deg' }] }} />
+                )}
               </TouchableOpacity>
               <View style={styles.chatInfo}>
                 <Text style={styles.chatName}>{item.name}</Text>
@@ -609,6 +889,67 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       >
         <Ionicons name="key-outline" size={24} color="#000" />
       </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.groupFab}
+        onPress={() => setGroupModalVisible(true)}
+      >
+        <Ionicons name="add" size={30} color="#000" />
+      </TouchableOpacity>
+
+      <Modal animationType="fade" transparent visible={groupModalVisible} onRequestClose={() => setGroupModalVisible(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalContent, { maxHeight: '85%' }]}>
+            <Text style={styles.modalTitle}>Criar Grupo</Text>
+
+            <TouchableOpacity style={styles.groupPhotoButton} onPress={pickGroupPhoto}>
+              {newGroupPhoto ? (
+                <Image source={{ uri: newGroupPhoto }} style={styles.groupPhotoPreview} />
+              ) : (
+                <Ionicons name="camera-outline" size={28} color="#00ff66" />
+              )}
+            </TouchableOpacity>
+
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Nome do grupo"
+              placeholderTextColor="#475569"
+              value={newGroupName}
+              onChangeText={setNewGroupName}
+            />
+
+            <Text style={styles.groupSectionLabel}>Contatos</Text>
+            {groupContactOptions.length === 0 ? (
+              <Text style={styles.emptyGroupText}>Adicione um contato antes de criar um grupo.</Text>
+            ) : (
+              <ScrollView style={styles.groupContactsList} showsVerticalScrollIndicator={false}>
+                {groupContactOptions.map(contact => {
+                  const selected = selectedGroupContacts.includes(contact.token);
+                  return (
+                    <TouchableOpacity key={contact.token} style={styles.groupContactRow} onPress={() => toggleGroupContact(contact.token)}>
+                      <Ionicons name={selected ? "checkbox" : "square-outline"} size={22} color={selected ? "#00ff66" : "#64748B"} />
+                      <View style={{ flex: 1, marginLeft: 10 }}>
+                        <Text style={styles.groupContactName}>{contact.name}</Text>
+                        <Text style={styles.groupContactToken}>{contact.token}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            )}
+
+            <View style={styles.modalButtons}>
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#152233' }]} onPress={() => { resetGroupForm(); setGroupModalVisible(false); }}>
+                <Text style={{ color: '#fff' }}>Cancelar</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#00ff66', opacity: adding ? 0.7 : 1 }]} onPress={handleCreateGroup} disabled={adding}>
+                <Text style={{ color: '#000', fontWeight: 'bold' }}>{adding ? 'Criando...' : 'Criar'}</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
 
       {/* Modal Parear */}
       <Modal animationType="fade" transparent visible={modalVisible} onRequestClose={() => setModalVisible(false)}>
@@ -636,10 +977,12 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
               <Text style={{ color: '#fff', fontSize: 15 }}>{pinnedTokens.includes(chatOptionTarget?.token) ? "Desafixar do Topo" : "Fixar no Topo"}</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.optionRowItem} onPress={() => { setOptionsModalVisible(false); setSelectedChat(chatOptionTarget); setEditedName(chatOptionTarget.name); setEditModalVisible(true); }}>
-              <Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 12 }} />
-              <Text style={{ color: '#fff', fontSize: 15 }}>Editar Nome do Contato</Text>
-            </TouchableOpacity>
+            {!isGroupToken(chatOptionTarget?.token) && (
+              <TouchableOpacity style={styles.optionRowItem} onPress={() => { setOptionsModalVisible(false); setSelectedChat(chatOptionTarget); setEditedName(chatOptionTarget.name); setEditModalVisible(true); }}>
+                <Ionicons name="create-outline" size={18} color="#fff" style={{ marginRight: 12 }} />
+                <Text style={{ color: '#fff', fontSize: 15 }}>Editar Nome do Contato</Text>
+              </TouchableOpacity>
+            )}
             
             <TouchableOpacity style={styles.optionRowItem} onPress={handleDeleteChannel}>
               <Ionicons name="trash-outline" size={18} color="#ef4444" style={{ marginRight: 12 }} />
@@ -733,13 +1076,27 @@ const styles = StyleSheet.create({
   unreadBadge: { backgroundColor: '#00ff66', minWidth: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 5, marginLeft: 10 },
   unreadText: { color: '#000', fontSize: 11, fontWeight: 'bold' },
   fab: { position: 'absolute', bottom: 30, right: 30, backgroundColor: '#00ff66', width: 56, height: 56, borderRadius: 28, justifyContent: 'center', alignItems: 'center' },
+  groupFab: { position: 'absolute', bottom: 30, left: 30, backgroundColor: '#00ff66', width: 56, height: 56, borderRadius: 28, justifyContent: 'center', alignItems: 'center' },
+  avatarImage: { width: 44, height: 44, borderRadius: 22 },
   emptyContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   emptyText: { color: '#475569', fontSize: 14 },
+  retryButton: { marginTop: 14, paddingVertical: 10, paddingHorizontal: 16, borderRadius: 12, backgroundColor: '#00ff66' },
+  retryButtonText: { color: '#000', fontWeight: 'bold' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
   modalContent: { backgroundColor: '#0d0d0d', borderRadius: 24, padding: 25, borderWidth: 1, borderColor: '#1F2937', width: '100%', maxWidth: 340 },
   modalTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 20, textAlign: 'center' },
   modalInput: { backgroundColor: '#111827', color: '#fff', padding: 14, borderRadius: 12, fontSize: 16, borderWidth: 1, borderColor: '#1F2937', marginBottom: 15, width: '100%' },
   modalButtons: { flexDirection: 'row', justifyContent: 'space-between' },
   modalBtn: { flex: 1, padding: 14, borderRadius: 12, alignItems: 'center', marginHorizontal: 6 },
+  groupPhotoButton: { width: 78, height: 78, borderRadius: 39, backgroundColor: '#111827', borderWidth: 1, borderColor: '#1F2937', justifyContent: 'center', alignItems: 'center', alignSelf: 'center', marginBottom: 16, overflow: 'hidden' },
+  groupPhotoPreview: { width: 78, height: 78, borderRadius: 39 },
+  groupSectionLabel: { color: '#64748B', fontSize: 12, textTransform: 'uppercase', fontWeight: 'bold', marginBottom: 8 },
+  emptyGroupText: { color: '#64748B', fontSize: 13, textAlign: 'center', marginBottom: 16 },
+  groupContactsList: { maxHeight: 220, marginBottom: 16 },
+  groupContactRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, borderBottomWidth: 1, borderColor: '#111827' },
+  groupContactName: { color: '#fff', fontSize: 14, fontWeight: 'bold' },
+  groupContactToken: { color: '#64748B', fontSize: 12, marginTop: 2 },
   optionRowItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 14, borderBottomWidth: 1, borderColor: '#111827' }
 });
+
+

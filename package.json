@@ -1,6 +1,6 @@
 {
   "name": "liveweather",
-  "version": "2.7.3",
+  "version": "2.7.5",
   "license": "0BSD",
   "main": "index.js",
   "scripts": {

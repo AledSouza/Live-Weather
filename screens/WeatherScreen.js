@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, TextInput, ActivityIndicator, FlatList, Keyboard, Platform, ScrollView } from 'react-native';
+import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, TextInput, ActivityIndicator, FlatList, Keyboard, Platform, ScrollView, RefreshControl } from 'react-native';
 import { Ionicons, Feather } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -11,6 +11,7 @@ export default function WeatherScreen({ onUnlock }) {
   const [weatherData, setWeatherData] = useState(null);
   const [forecastData, setForecastData] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [searching, setSearching] = useState(false);
   const [apiError, setApiError] = useState(null);
 
@@ -20,7 +21,21 @@ export default function WeatherScreen({ onUnlock }) {
     const loadSavedCity = async () => {
       try {
         const savedCity = await AsyncStorage.getItem('@user_city');
-        fetchWeather(savedCity || 'São Bernardo do Campo');
+        const cachedWeather = await AsyncStorage.getItem('@weather_cache');
+        let hasCachedWeather = false;
+        if (cachedWeather) {
+          try {
+            const parsedCache = JSON.parse(cachedWeather);
+            setWeatherData(parsedCache.weatherData);
+            setForecastData(parsedCache.forecastData || []);
+            setCity(parsedCache.city || savedCity || '');
+            setLoading(false);
+            hasCachedWeather = true;
+          } catch (cacheError) {
+            await AsyncStorage.removeItem('@weather_cache');
+          }
+        }
+        fetchWeather(savedCity || 'São Bernardo do Campo', false, hasCachedWeather);
       } catch (e) {
         setLoading(false);
       }
@@ -28,8 +43,10 @@ export default function WeatherScreen({ onUnlock }) {
     loadSavedCity();
   }, []);
 
-  const fetchWeather = async (cityName) => {
-    setLoading(true);
+  const fetchWeather = async (cityName, isRefresh = false, keepExisting = false) => {
+    const hasVisibleData = keepExisting || !!weatherData;
+    if (isRefresh) setRefreshing(true);
+    else if (!hasVisibleData) setLoading(true);
     setApiError(null);
     try {
       const [weatherRes, forecastRes] = await Promise.all([
@@ -38,6 +55,7 @@ export default function WeatherScreen({ onUnlock }) {
       ]);
 
       const data = await weatherRes.json();
+      let nextForecastData = [];
 
       if (weatherRes.ok) {
         setCity(data.name);
@@ -66,20 +84,31 @@ export default function WeatherScreen({ onUnlock }) {
             data.main.temp_max = Math.max(data.main.temp, daily[0].max);
           }
 
-          setForecastData(daily.slice(0, 5));
+          nextForecastData = daily.slice(0, 5);
+          setForecastData(nextForecastData);
         }
         setWeatherData(data);
+        await AsyncStorage.setItem('@weather_cache', JSON.stringify({
+          city: data.name,
+          weatherData: data,
+          forecastData: nextForecastData
+        }));
       } else {
-        setWeatherData(null);
-        setForecastData([]);
+        if (!hasVisibleData) {
+          setWeatherData(null);
+          setForecastData([]);
+        }
         setApiError(data.message || 'Cidade não localizada.');
       }
     } catch (err) {
-      setWeatherData(null);
-      setForecastData([]);
-      setApiError('Sem conexão.');
+      if (!hasVisibleData) {
+        setWeatherData(null);
+        setForecastData([]);
+      }
+      setApiError('Sem conexao. Verifique sua internet e tente novamente.');
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   };
 
@@ -114,6 +143,10 @@ export default function WeatherScreen({ onUnlock }) {
     setSearchQuery('');
     setSuggestions([]);
     Keyboard.dismiss(); 
+  };
+
+  const handleRefresh = () => {
+    fetchWeather(city || 'São Bernardo do Campo', true);
   };
 
   return (
@@ -151,7 +184,18 @@ export default function WeatherScreen({ onUnlock }) {
       {loading ? (
         <ActivityIndicator size="large" color="#00ff66" style={{ flex: 1 }} />
       ) : weatherData ? (
-        <ScrollView contentContainerStyle={{ flexGrow: 1, paddingBottom: 20 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+        <ScrollView
+          contentContainerStyle={{ flexGrow: 1, paddingBottom: 20 }}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} tintColor="#00ff66" colors={['#00ff66']} />}
+        >
+          {apiError && (
+            <View style={styles.offlineBanner}>
+              <Ionicons name="cloud-offline-outline" size={16} color="#facc15" />
+              <Text style={styles.offlineBannerText}>{apiError}</Text>
+            </View>
+          )}
           <View style={styles.mainContainerWrapper}>
             <View style={styles.header}>
               <Text style={styles.city}>{weatherData.name}</Text>
@@ -224,8 +268,15 @@ export default function WeatherScreen({ onUnlock }) {
         </ScrollView>
       ) : (
         <View style={styles.welcomeContainer}>
-          <Ionicons name="partly-sunny-outline" size={100} color="#64748B" style={styles.welcomeIcon} />
-          <Text style={styles.welcomeTitle}>Seja Bem-vindo(a)</Text>
+          <Ionicons name={apiError ? "cloud-offline-outline" : "partly-sunny-outline"} size={100} color="#cbd5e1" style={styles.welcomeIcon} />
+          <Text style={styles.welcomeTitle}>{apiError ? 'Sem conexao' : 'Seja Bem-vindo(a)'}</Text>
+          <Text style={styles.welcomeSubtitle}>
+            {apiError || 'Busque sua cidade para ver a previsao.'}
+          </Text>
+          <TouchableOpacity style={styles.retryButton} onPress={handleRefresh} disabled={refreshing}>
+            {refreshing ? <ActivityIndicator size="small" color="#0B132B" /> : <Ionicons name="refresh" size={18} color="#0B132B" />}
+            <Text style={styles.retryButtonText}>Tentar novamente</Text>
+          </TouchableOpacity>
         </View>
       )}
       </SafeAreaView>
@@ -241,6 +292,8 @@ const styles = StyleSheet.create({
   suggestionsContainer: { backgroundColor: '#1e293b', borderRadius: 16, position: 'absolute', top: 60, left: 0, right: 0, borderWidth: 1, borderColor: 'rgba(255, 255, 255, 0.2)', zIndex: 99, elevation: 5, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 3.84 },
   suggestionItem: { flexDirection: 'row', alignItems: 'center', padding: 15, borderBottomWidth: 1, borderBottomColor: 'rgba(255, 255, 255, 0.1)' },
   suggestionText: { color: '#fff', fontSize: 16 },
+  offlineBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(15, 23, 42, 0.72)', borderWidth: 1, borderColor: 'rgba(250, 204, 21, 0.35)', borderRadius: 14, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 10 },
+  offlineBannerText: { color: '#fde68a', fontSize: 13, marginLeft: 8, flex: 1 },
   mainContainerWrapper: { flexGrow: 1, justifyContent: 'space-between' },
   header: { alignItems: 'center', marginTop: 15 },
   city: { color: '#fff', fontSize: 34, fontWeight: 'bold', textShadowColor: 'rgba(0,0,0,0.3)', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 3 },
@@ -263,5 +316,8 @@ const styles = StyleSheet.create({
   forecastMin: { color: '#94a3b8', fontSize: 13, fontWeight: '600', marginTop: 2 },
   welcomeContainer: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   welcomeIcon: { marginBottom: 10, opacity: 0.5 },
-  welcomeTitle: { color: '#fff', fontSize: 28, fontWeight: 'bold' }
+  welcomeTitle: { color: '#fff', fontSize: 28, fontWeight: 'bold' },
+  welcomeSubtitle: { color: '#cbd5e1', fontSize: 15, textAlign: 'center', marginTop: 8, marginBottom: 18, paddingHorizontal: 20 },
+  retryButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#00ff66', borderRadius: 18, paddingHorizontal: 18, paddingVertical: 11 },
+  retryButtonText: { color: '#0B132B', fontSize: 14, fontWeight: 'bold', marginLeft: 8 }
 });
