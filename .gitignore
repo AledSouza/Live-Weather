@@ -1,49 +1,41 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+# Learn more: https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 
-# dependencies
+# Dependencies
 node_modules/
 
-# Expo
+# Expo / React Native
 .expo/
 dist/
 web-build/
-expo-env.d.ts
-
-# Native
-.kotlin/
-*.orig.*
-*.jks
-*.p8
-*.p12
-*.key
-*.mobileprovision
-
-# Firebase Service Account Keys
-*firebase-adminsdk*.json
-
-# Metro
-.metro-health-check*
-
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
-.DS_Store
-*.pem
-
-# local env files
-.env*.local
-
-# typescript
+android/
+ios/
 *.tsbuildinfo
 
-# generated native folders
-/ios
-/android
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+expo-verify*.log
 
-Toast.js
-expo-verify.err.log
-expo-verify.log
- supabase-grupos-descricao.sql
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.p8
+*.key
+*.mobileprovision
+*.jks
+
+*firebase-adminsdk*.json
+
+# OS / editor files
+.DS_Store
+.vscode/
+
+# Generated or temporary files
+.kotlin/
+*.orig.*
+.metro-health-check*

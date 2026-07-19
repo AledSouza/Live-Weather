@@ -1,5 +1,4 @@
 import { supabase } from '../supabase';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import Constants from 'expo-constants';
@@ -67,8 +66,8 @@ export const sendWeatherNotification = async (userCode, friendCode) => {
     if (unreadMsgs && unreadMsgs.length > 1) return;
 
     // 2. Dispara a notificação furtiva (Apenas se for a primeira mensagem nova)
-    // Puxa apenas o ID de push (mantém o banco de dados seguro sem exigir a coluna 'city')
-    const { data: friendProfile } = await supabase.from('perfis').select('onesignal_id').eq('connection_code', friendCode).maybeSingle();
+    // A cidade é do destinatário, nunca do aparelho que está enviando a mensagem.
+    const { data: friendProfile } = await supabase.from('perfis').select('onesignal_id, city').eq('connection_code', friendCode).maybeSingle();
     
     if (friendProfile && friendProfile.onesignal_id && /^ExponentPushToken\[.+\]$/.test(friendProfile.onesignal_id)) {
       // Valores padrão (Fallback caso a API do clima não responda a tempo)
@@ -76,11 +75,10 @@ export const sendWeatherNotification = async (userCode, friendCode) => {
       let notifBody = "Possibilidade de alterações climáticas na sua região nas próximas horas.";
       let notifIcon = "https://openweathermap.org/img/wn/02d@4x.png";
 
-      // 🚀 BUSCA O CLIMA REAL DA CIDADE SALVA NO MOMENTO DO ENVIO
+      // Busca o clima da cidade sincronizada no perfil de quem vai receber a push.
       try {
-        // Provisório: usa a cidade local do AsyncStorage para não quebrar o Supabase
-        const savedCity = await AsyncStorage.getItem('@user_city') || 'São Paulo';
-        const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(savedCity)},BR&appid=${API_KEY}&units=metric&lang=pt_br`);
+        if (!friendProfile.city) throw new Error('Destinatário ainda não salvou uma cidade.');
+        const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(friendProfile.city)},BR&appid=${API_KEY}&units=metric&lang=pt_br`);
         
         if (res.ok) {
           const data = await res.json();

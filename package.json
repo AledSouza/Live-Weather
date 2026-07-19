@@ -48,5 +48,10 @@
         ]
       }
     }
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.10",
+    "supabase": "^2.109.1",
+    "typescript": "~5.9.2"
   }
 }

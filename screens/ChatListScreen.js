@@ -13,6 +13,9 @@ const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
 const GROUP_PREFIX = 'group:';
 const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
 const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
+const normalizeToken = (token) => String(token || '').trim().toLowerCase();
+const normalizePinnedTokens = (tokens = []) => [...new Set((tokens || []).map(normalizeToken).filter(Boolean))];
+const getPinnedStorageKey = (value) => `@pinned_${normalizeToken(value)}`;
 
 // ✅ Extrai o path real do arquivo relativo ao bucket
 const extractStoragePath = (url) => {
@@ -154,8 +157,19 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
   // Carrega os canais fixados salvos na memória do celular
   const loadPinnedChats = async () => {
     try {
-      const stored = await AsyncStorage.getItem(`@pinned_${userCode}`);
-      if (stored) setPinnedTokens(JSON.parse(stored));
+      const storageKey = getPinnedStorageKey(userCode);
+      const legacyKey = `@pinned_${String(userCode || '').trim()}`;
+      const [currentStored, legacyStored] = await Promise.all([
+        AsyncStorage.getItem(storageKey),
+        AsyncStorage.getItem(legacyKey)
+      ]);
+      const merged = normalizePinnedTokens([
+        ...(currentStored ? JSON.parse(currentStored) : []),
+        ...(legacyStored ? JSON.parse(legacyStored) : [])
+      ]);
+      if (merged.length > 0) {
+        setPinnedTokens(merged);
+      }
     } catch (e) { console.error(e); }
   };
 
@@ -449,8 +463,23 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       const groupTokens = myGroupIds.map(getGroupToken);
       
       // 🚀 Extrai automaticamente os contatos fixados do banco de dados!
-      const pins = myConnections?.filter(c => c.is_pinned).map(c => c.friend_code.trim().toLowerCase()) || [];
-      setPinnedTokens(pins);
+      const cloudPins = myConnections?.filter(c => c.is_pinned).map(c => normalizeToken(c.friend_code)) || [];
+      // Os grupos não possuem coluna is_pinned. Preserve os fixados locais deles ao
+      // sincronizar os contatos, em vez de apagá-los a cada atualização da lista.
+      let localPins = [];
+      try {
+        const storageKey = getPinnedStorageKey(userCode);
+        const legacyKey = `@pinned_${String(userCode || '').trim()}`;
+        const [currentStored, legacyStored] = await Promise.all([
+          AsyncStorage.getItem(storageKey),
+          AsyncStorage.getItem(legacyKey)
+        ]);
+        localPins = [
+          ...(currentStored ? JSON.parse(currentStored) : []),
+          ...(legacyStored ? JSON.parse(legacyStored) : [])
+        ];
+      } catch (_) {}
+      setPinnedTokens([...new Set([...cloudPins, ...normalizePinnedTokens(localPins)])]);
 
       // Busca todas as mensagens enviadas ou recebidas por você, ordenadas da mais nova para a mais velha
       const { data: allMessages, error: messagesError } = await withTimeout(supabase
@@ -517,6 +546,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           token: cleanKey,
           name: c.friend_name,
           lastMessage: getPreview(cleanKey),
+          lastActivity: messages.find(m =>
+            (m.sender_code.trim().toLowerCase() === myCleanCode && m.receiver_code.trim().toLowerCase() === cleanKey) ||
+            (m.sender_code.trim().toLowerCase() === cleanKey && m.receiver_code.trim().toLowerCase() === myCleanCode)
+          )?.created_at || null,
           isConnection: true,
           unread: unreadCount
         });
@@ -531,6 +564,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
             token: cleanKey,
             name: p.nickname,
             lastMessage: getPreview(cleanKey),
+            lastActivity: messages.find(m =>
+              (m.sender_code.trim().toLowerCase() === myCleanCode && m.receiver_code.trim().toLowerCase() === cleanKey) ||
+              (m.sender_code.trim().toLowerCase() === cleanKey && m.receiver_code.trim().toLowerCase() === myCleanCode)
+            )?.created_at || null,
             isConnection: false,
             unread: unreadCount
           });
@@ -549,6 +586,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
           photoUrl: group.photo_url,
           createdBy: group.created_by,
           lastMessage: getMessagePreview(lastMsg, prefix),
+          lastActivity: lastMsg?.created_at || null,
           isConnection: false,
           isGroup: true,
           unread: groupMsgs.filter(m => m.sender_code?.trim?.().toLowerCase() !== myCleanCode && m.read_at === null).length
@@ -609,23 +647,23 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
   // 🚀 FUNÇÃO: Fixa ou desafixa o chat jogando as flags para a ordenação
   const handleTogglePinChat = async (token) => {
- 
-    const isCurrentlyPinned = pinnedTokens.includes(token);
+    const normalizedToken = normalizeToken(token);
+    const isCurrentlyPinned = pinnedTokens.some(pin => normalizeToken(pin) === normalizedToken);
     const newVal = !isCurrentlyPinned;
 
-    let updatedPins = [...pinnedTokens];
+    let updatedPins = normalizePinnedTokens(pinnedTokens);
     if (isCurrentlyPinned) {
-      updatedPins = updatedPins.filter(t => t !== token);
+      updatedPins = updatedPins.filter(t => t !== normalizedToken);
     } else {
-      updatedPins.push(token);
+      updatedPins.push(normalizedToken);
     }
     setPinnedTokens(updatedPins);
-    await AsyncStorage.setItem(`@pinned_${userCode}`, JSON.stringify(updatedPins));
+    await AsyncStorage.setItem(getPinnedStorageKey(userCode), JSON.stringify(updatedPins));
     setOptionsModalVisible(false);
 
     // 🚀 Salva a preferência direto no banco de dados na nuvem
     if (!isGroupToken(token)) {
-      await supabase.from('conexoes').update({ is_pinned: newVal }).eq('user_code', userCode.trim().toLowerCase()).eq('friend_code', token);
+      await supabase.from('conexoes').update({ is_pinned: newVal }).eq('user_code', userCode.trim().toLowerCase()).eq('friend_code', normalizedToken);
     }
   };
 
@@ -783,10 +821,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
                 if (conn1) console.error('Erro conexão dir. 1:', conn1);
 
                 // ─── 5. Limpa o pin local se existia ───
-                if (pinnedTokens.includes(friendCode)) {
-                  const updatedPins = pinnedTokens.filter(t => t !== friendCode);
+                if (pinnedTokens.some(pin => normalizeToken(pin) === normalizeToken(friendCode))) {
+                  const updatedPins = normalizePinnedTokens(pinnedTokens).filter(t => t !== normalizeToken(friendCode));
                   setPinnedTokens(updatedPins);
-                  await AsyncStorage.setItem(`@pinned_${userCode}`, JSON.stringify(updatedPins));
+                  await AsyncStorage.setItem(getPinnedStorageKey(userCode), JSON.stringify(updatedPins));
                 }
 
                 setChatOptionTarget(null);
@@ -799,10 +837,32 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     }, 300);
   };
 
-  // 🚀 LÓGICA DE COMPOSIÇÃO: Mapeia os fixados e joga para o topo da lista
-  const processedChats = chats
-    .map(c => ({ ...c, isPinned: pinnedTokens.includes(c.token) }))
-    .sort((a, b) => (b.isPinned ? 1 : 0) - (a.isPinned ? 1 : 0));
+  // 🚀 LÓGICA DE COMPOSIÇÃO: Fixados sempre ficam acima e os demais seguem por atividade recente
+  const normalizedPinnedTokens = new Set(normalizePinnedTokens(pinnedTokens));
+  const pinnedChats = [];
+  const regularChats = [];
+
+  chats.forEach((chat) => {
+    const item = { ...chat, isPinned: normalizedPinnedTokens.has(normalizeToken(chat.token)) };
+    if (item.isPinned) {
+      pinnedChats.push(item);
+    } else {
+      regularChats.push(item);
+    }
+  });
+
+  pinnedChats.sort((a, b) => {
+    const activityDiff = new Date(b.lastActivity || 0).getTime() - new Date(a.lastActivity || 0).getTime();
+    if (activityDiff !== 0) return activityDiff;
+    return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+  });
+  regularChats.sort((a, b) => {
+    const activityDiff = new Date(b.lastActivity || 0).getTime() - new Date(a.lastActivity || 0).getTime();
+    if (activityDiff !== 0) return activityDiff;
+    return String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+  });
+
+  const processedChats = [...pinnedChats, ...regularChats];
   const groupContactOptions = chats.filter(c => !isGroupToken(c.token));
 
   return (
@@ -974,7 +1034,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
             
             <TouchableOpacity style={styles.optionRowItem} onPress={() => handleTogglePinChat(chatOptionTarget?.token)}>
               <Ionicons name="pin" size={18} color="#fff" style={{ marginRight: 12, transform: [{ rotate: '45deg' }] }} />
-              <Text style={{ color: '#fff', fontSize: 15 }}>{pinnedTokens.includes(chatOptionTarget?.token) ? "Desafixar do Topo" : "Fixar no Topo"}</Text>
+              <Text style={{ color: '#fff', fontSize: 15 }}>{pinnedTokens.some(pin => normalizeToken(pin) === normalizeToken(chatOptionTarget?.token)) ? "Desafixar do Topo" : "Fixar no Topo"}</Text>
             </TouchableOpacity>
 
             {!isGroupToken(chatOptionTarget?.token) && (

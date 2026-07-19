@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 // 🚀 CORREÇÃO: Adicionados Text e TouchableOpacity que estavam faltando aqui
 import { View, StyleSheet, ActivityIndicator, Keyboard, Platform, StatusBar, Text, TouchableOpacity, TextInput, AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -20,6 +20,8 @@ function AppShell() {
   const inactivityTimer = useRef(null);
   const isPickerActiveRef = useRef(false);
   const toast = useToast();
+  // Retorna ao clima após 3 minutos e 30 segundos sem interação.
+  const INACTIVITY_TIMEOUT_MS = 3.5 * 60 * 1000;
   const [isChatMode, setIsChatMode] = useState(false);
   const [currentScreen, setCurrentScreen] = useState('gateway'); // 'gateway', 'list', 'room'
   const [nickname, setNickname] = useState('');
@@ -51,12 +53,12 @@ function AppShell() {
   };
 
   // Função que renova o tempo sempre que a tela é tocada
-  const resetInactivityTimer = () => {
+  const resetInactivityTimer = useCallback(() => {
     if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
     inactivityTimer.current = setTimeout(() => {
       setIsChatMode(false);
-    }, 120000); // Bloqueia após 2 minutos sem tocar na tela
-  };
+    }, INACTIVITY_TIMEOUT_MS);
+  }, []);
 
   useEffect(() => {
 
@@ -70,6 +72,9 @@ function AppShell() {
       }
     };
     secureScreen();
+
+    const keyboardDidShowListener = Keyboard.addListener('keyboardDidShow', resetInactivityTimer);
+    const keyboardDidHideListener = Keyboard.addListener('keyboardDidHide', resetInactivityTimer);
 
     const subscription = AppState.addEventListener('change', async nextAppState => {
       try {
@@ -123,10 +128,12 @@ function AppShell() {
     checkIdentity();
 
     return () => {
+      keyboardDidShowListener.remove();
+      keyboardDidHideListener.remove();
       subscription.remove();
       if (inactivityTimer.current) clearTimeout(inactivityTimer.current);
     };
-  }, []);
+  }, [resetInactivityTimer]);
 
   // 🚀 LÓGICA DE ATIVAÇÃO DO PÂNICO GERAL
   const executePanicProtocol = async () => {
@@ -216,7 +223,13 @@ function AppShell() {
 
       // Limpa os caches locais da memória do dispositivo
       const keys = await AsyncStorage.getAllKeys();
-      const cacheKeys = keys.filter(k => k.startsWith('@cache_msgs_') || k.startsWith('@queue_') || k.startsWith('@cache_chats_'));
+      const cacheKeys = keys.filter(k =>
+        k.startsWith('@cache_msgs_') ||
+        k.startsWith('@queue_') ||
+        k.startsWith('@cache_chats_') ||
+        k.startsWith('@pinned_') ||
+        k.startsWith('@bg_')
+      );
       if (cacheKeys.length > 0) await AsyncStorage.multiRemove(cacheKeys);
 
     } catch (e) {
@@ -325,6 +338,7 @@ function AppShell() {
             friendName={activeFriendName}
             setPickerActive={(val) => { isPickerActiveRef.current = val; }}
             onBack={() => setCurrentScreen('list')}
+            onUserActivity={resetInactivityTimer}
           />
         );
       }
@@ -336,6 +350,7 @@ function AppShell() {
             userCode={connectionCode} 
             userNickname={nickname}
             setPickerActive={(val) => { isPickerActiveRef.current = val; }}
+            onUserActivity={resetInactivityTimer}
             onOpenChat={(code, name) => {
               setActiveFriendCode(code);
               setActiveFriendName(name);
@@ -368,7 +383,7 @@ function AppShell() {
       );
     }
 
-    return <WeatherScreen onUnlock={handleUnlockTrigger} />;
+    return <WeatherScreen onUnlock={handleUnlockTrigger} userCode={connectionCode} />;
   };
 
   if (loading) {

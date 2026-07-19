@@ -31,8 +31,23 @@ const DEFAULT_AI_NAME = 'Gemini';
 const DEFAULT_APP_THEME_COLOR = '#00ff66';
 const AI_DEFAULT_TIMEOUT_SECONDS = 35;
 const AI_DEFAULT_MAX_RETRIES = 2;
+const MESSAGE_PAGE_SIZE = 60;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const URL_PATTERN = /https?:\/\/[^\s<>()]+/i;
+const linkPreviewCache = new Map();
+const linkPreviewRequests = new Map();
+
+const getFirstValidHttpUrl = (text) => {
+  const match = String(text || '').match(URL_PATTERN);
+  if (!match) return null;
+  try {
+    const url = new URL(match[0]);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
+};
 
 // 🚀 Sincronizador Global de Tempo (Proteção contra hora errada no celular)
 let globalTimeOffset = 0;
@@ -226,7 +241,7 @@ const SwipeableMessage = ({ children, onReply }) => {
   );
 };
 
-export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive }) {
+export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive, onUserActivity }) {
   const toast = useToast();
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
@@ -238,6 +253,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [currentFriendName, setCurrentFriendName] = useState(friendName);
   const [groupInfoVisible, setGroupInfoVisible] = useState(false);
   const [groupInfo, setGroupInfo] = useState(null);
+  const [groupMembers, setGroupMembers] = useState([]);
   const [groupDescriptionDraft, setGroupDescriptionDraft] = useState('');
   const [savingGroupDescription, setSavingGroupDescription] = useState(false);
   const [groupNameDraft, setGroupNameDraft] = useState('');
@@ -270,15 +286,22 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [infoModalMessage, setInfoModalMessage] = useState(null);
   const [mediaGalleryVisible, setMediaGalleryVisible] = useState(false);
   const [mediaGalleryTab, setMediaGalleryTab] = useState('media');
+  const [galleryMessages, setGalleryMessages] = useState(null);
+  const [loadingGalleryMessages, setLoadingGalleryMessages] = useState(false);
   const [showBlueTicks, setShowBlueTicks] = useState(false);
   const showBlueTicksRef = useRef(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const [recentEmojis, setRecentEmojis] = useState(['👍', '❤️', '😂', '😮', '😢', '🙏']);
   const [friendLastSeen, setFriendLastSeen] = useState(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState(null);
+  const [replyTargets, setReplyTargets] = useState({});
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [messageSearchQuery, setMessageSearchQuery] = useState('');
+  const [settledMessageSearchQuery, setSettledMessageSearchQuery] = useState('');
+  const [serverSearchResults, setServerSearchResults] = useState([]);
   const [searchResultIndex, setSearchResultIndex] = useState(0);
+  const [hasOlderMessages, setHasOlderMessages] = useState(true);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const messageSearchInputRef = useRef(null);
   const [renderKey, setRenderKey] = useState(0);
   const [pinnedMessage, setPinnedMessage] = useState(null);
@@ -310,6 +333,39 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const isGroupChat = isGroupToken(cleanFriendCode);
   const groupId = isGroupChat ? cleanFriendCode.slice(GROUP_PREFIX.length) : null;
   const roomKey = isGroupChat ? cleanFriendCode : [userCode.trim().toLowerCase(), cleanFriendCode].sort().join('-');
+
+  useEffect(() => {
+    if (!mediaGalleryVisible) return;
+    let cancelled = false;
+    const loadGalleryMessages = async () => {
+      setLoadingGalleryMessages(true);
+      try {
+        const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
+        const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
+        const myCode = userCode.trim().toLowerCase();
+        const frCode = friendCode.trim().toLowerCase();
+        const roomFilter = isGroupChat
+          ? `receiver_code.eq.${frCode}`
+          : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
+        const allMessages = [];
+        const pageSize = 500;
+        for (let from = 0; ; from += pageSize) {
+          const { data, error } = await supabase.from('mensagens').select('*').or(roomFilter).order('created_at', { ascending: false }).range(from, from + pageSize - 1);
+          if (error) throw error;
+          allMessages.push(...(data || []));
+          if (!data || data.length < pageSize) break;
+        }
+        if (!cancelled) setGalleryMessages(allMessages.filter(m => new Date(m.created_at).getTime() > clearedTime));
+      } catch (error) {
+        console.warn('Erro ao carregar galeria completa:', error);
+        if (!cancelled) setGalleryMessages(null);
+      } finally {
+        if (!cancelled) setLoadingGalleryMessages(false);
+      }
+    };
+    loadGalleryMessages();
+    return () => { cancelled = true; };
+  }, [mediaGalleryVisible, userCode, friendCode, isGroupChat, roomKey]);
   const recordingRef = useRef(null);
   const recordingTimerRef = useRef(null);
   const audioPlayerRef = useRef(new Audio.Sound());
@@ -579,6 +635,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const flatListRef = useRef();
   const channelRef = useRef(null);
+  const messagesOffsetRef = useRef(0);
+  const loadingOlderMessagesRef = useRef(false);
   const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = useWindowDimensions();
   // Mantém os controles nativos do vídeo acima dos botões virtuais do Android.
   const androidNavigationInset = Platform.OS === 'android'
@@ -925,6 +983,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             const { data, error } = res;
             if (error) throw error;
 
+            requestAndSaveLinkPreview(data);
+
             // 🚀 SUCESSO ABSOLUTO! Remove da fila e transfere para a tela de chat na hora
             setPendingQueueSynced(prev => prev.filter(m => m.id !== message.id));
             setMessages(prev => {
@@ -1002,11 +1062,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           .from('mensagens')
           .select('*')
           .or(roomFilter)
-          .order('created_at', { ascending: false });
+          .order('created_at', { ascending: false })
+          .range(0, MESSAGE_PAGE_SIZE - 1);
 
         if (!error) {
           const filteredData = (data || []).filter(m => new Date(m.created_at).getTime() > clearedTime);
           setMessages(filteredData);
+          messagesOffsetRef.current = data?.length || 0;
+          setHasOlderMessages((data?.length || 0) === MESSAGE_PAGE_SIZE);
           AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(filteredData.slice(0, 60))).catch(() => {});
           marcarComoLidas();
         }
@@ -1143,12 +1206,32 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const fetchGroupInfo = useCallback(async () => {
     if (!groupId) return;
     try {
-      const { data, error } = await supabase
+      const [{ data, error }, { data: memberLinks, error: membersError }] = await Promise.all([
+        supabase
         .from('grupos')
         .select('id, name, photo_url, description')
         .eq('id', groupId)
-        .maybeSingle();
+        .maybeSingle(),
+        supabase.from('grupo_membros').select('member_code').eq('group_id', groupId)
+      ]);
       if (error) throw error;
+      if (membersError) throw membersError;
+      const memberCodes = (memberLinks || []).map(member => member.member_code?.trim().toLowerCase()).filter(Boolean);
+      if (memberCodes.length > 0) {
+        const { data: profiles, error: profilesError } = await supabase
+          .from('perfis')
+          .select('connection_code, nickname')
+          .in('connection_code', memberCodes);
+        if (profilesError) console.warn('Não foi possível obter os nomes dos membros:', profilesError);
+        const profileByCode = new Map((profiles || []).map(profile => [profile.connection_code?.trim().toLowerCase(), profile.nickname]));
+        const myCode = userCode.trim().toLowerCase();
+        setGroupMembers(memberCodes.map(code => ({
+          code,
+          name: code === myCode ? 'Você' : (profileByCode.get(code) || code)
+        })));
+      } else {
+        setGroupMembers([]);
+      }
       if (data) {
         setGroupInfo(data);
         if (!isEditingGroupInfoRef.current) {
@@ -1161,7 +1244,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     } catch (error) {
       console.warn('Erro ao buscar informações do grupo:', error);
     }
-  }, [groupId, friendName]);
+  }, [groupId, friendName, userCode]);
 
   useEffect(() => {
     if (!isGroupChat) return;
@@ -1186,6 +1269,19 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       supabase.removeChannel(groupChannel);
     };
   }, [isGroupChat, groupId, friendName, fetchGroupInfo]);
+
+  // Uma resposta pode apontar para uma mensagem de páginas antigas. Buscamos só os
+  // alvos que faltam para manter o cartão de resposta clicável, sem carregar o chat inteiro.
+  useEffect(() => {
+    const missingIds = [...new Set(messages.map(message => message.reply_to_id).filter(id => id && !messages.some(message => message.id === id) && !replyTargets[id]))];
+    if (!missingIds.length) return;
+    let cancelled = false;
+    supabase.from('mensagens').select('*').in('id', missingIds).then(({ data, error }) => {
+      if (cancelled || error || !data?.length) return;
+      setReplyTargets(previous => ({ ...previous, ...Object.fromEntries(data.map(message => [message.id, message])) }));
+    });
+    return () => { cancelled = true; };
+  }, [messages, replyTargets]);
 
   useEffect(() => {
     if (!groupInfoVisible || !isGroupChat || !groupInfo) return;
@@ -1310,6 +1406,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const handleTextChange = (text) => {
+    onUserActivity?.();
     inputTextRef.current = text; // 🚀 Salva imediatamente na memória absoluta
     setInputText(text);
 
@@ -1319,6 +1416,48 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     // 🚀 Chama a busca por sugestões de emoji
     fetchEmojiSuggestions(text);
   };
+
+  const requestAndSaveLinkPreview = useCallback(async (message) => {
+    if (!message?.id || message.media_url) return;
+    const url = getFirstValidHttpUrl(message.content);
+    if (!url) return;
+
+    let preview = linkPreviewCache.get(url);
+    if (preview === undefined) {
+      let request = linkPreviewRequests.get(url);
+      if (!request) {
+        request = supabase.functions
+          .invoke('link-preview', { body: { url } })
+          .then(({ data, error }) => {
+            if (error) throw error;
+            return data?.preview || null;
+          })
+          .catch((error) => {
+            console.warn('Prévia de link indisponível:', error?.message || error);
+            return null;
+          })
+          .finally(() => linkPreviewRequests.delete(url));
+        linkPreviewRequests.set(url, request);
+      }
+      preview = await request;
+      linkPreviewCache.set(url, preview);
+    }
+
+    if (!preview) return;
+    const previewFields = {
+      link_url: preview.url || url,
+      preview_title: preview.title || null,
+      preview_description: preview.description || null,
+      preview_image_url: preview.image_url || null,
+      preview_site_name: preview.site_name || null,
+    };
+    const { error } = await supabase.from('mensagens').update(previewFields).eq('id', message.id);
+    if (error) {
+      console.warn('Não foi possível gravar prévia do link:', error.message);
+      return;
+    }
+    setMessages(prev => prev.map(item => item.id === message.id ? { ...item, ...previewFields } : item));
+  }, []);
 
   const getAiContextText = () => {
     const recentMessages = [...messages]
@@ -1701,6 +1840,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     setReplyingTo(null);
   };
 
+  const handleSendComposer = async () => {
+    handleSendMessage();
+  };
+
   const handleDownloadAndShareFile = async (url, content) => {
     try {
       const [filename, filesize] = (content || '|').split('|');
@@ -1787,7 +1930,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   // resolvendo o bug onde a mídia só aparecia depois de fechar a galeria manualmente.
   const handleOpenMediaFromGallery = (item) => {
     // 1. Filtra todas as mídias válidas para a galeria
-    const mediaItems = messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
+    const mediaItems = (galleryMessages || messages).filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
     // 2. Encontra o índice do item clicado
     const initialIndex = mediaItems.findIndex(m => m.id === item.id);
 
@@ -1955,6 +2098,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   // 🚀 PAUSA a gravação em andamento, permitindo ao usuário lembrar o que ia dizer sem perder o áudio já gravado
   const handlePauseRecording = async () => {
+    onUserActivity?.();
     if (!recordingRef.current || isPaused) return;
     try {
       clearInterval(recordingTimerRef.current);
@@ -1970,6 +2114,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   // 🚀 RETOMA a gravação pausada, continuando exatamente de onde parou (mesmo arquivo de áudio)
   const handleResumeRecording = async () => {
+    onUserActivity?.();
     if (!recordingRef.current || !isPaused) return;
     try {
       await recordingRef.current.startAsync();
@@ -1985,6 +2130,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   // 🚀 CANCELA a gravação atual (pausada ou em andamento), descartando o áudio sem enviar
   const handleCancelRecording = async () => {
+    onUserActivity?.();
     recordingDragX.setValue(0);
     setIsRecordingCancelArmed(false);
     clearInterval(recordingTimerRef.current);
@@ -2007,6 +2153,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const stopRecording = async () => {
+    onUserActivity?.();
     if (!recordingRef.current) return;
 
     setIsRecording(false);
@@ -2353,11 +2500,104 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const handleScroll = (event) => {
     const yOffset = event.nativeEvent.contentOffset.y;
     setShowScrollToBottom(yOffset > 250);
+
+    // Fallback para Android: em listas invertidas, onEndReached pode nao disparar
+    // novamente depois da primeira pagina. Ao chegar no extremo das mensagens antigas,
+    // carregamos a proxima pagina manualmente.
+    const { contentSize, layoutMeasurement } = event.nativeEvent;
+    if (yOffset + layoutMeasurement.height >= contentSize.height - 140) {
+      loadOlderMessages();
+    }
+  };
+
+  // Com FlatList invertida, chegar ao "fim" significa ter chegado às mensagens antigas.
+  // Carregamos em páginas para o histórico não ficar limitado pelo cache ou pela resposta inicial.
+  const loadOlderMessages = async () => {
+    if (!hasOlderMessages || loadingOlderMessagesRef.current) return;
+    loadingOlderMessagesRef.current = true;
+    setLoadingOlderMessages(true);
+    try {
+      const clearedStr = await AsyncStorage.getItem(`@cleared_${userCode}_${friendCode}`);
+      const clearedTime = clearedStr ? new Date(clearedStr).getTime() : 0;
+      const myCode = userCode.trim().toLowerCase();
+      const frCode = friendCode.trim().toLowerCase();
+      const roomFilter = isGroupChat
+        ? `receiver_code.eq.${frCode}`
+        : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
+      const from = messagesOffsetRef.current;
+      const { data, error } = await supabase
+        .from('mensagens')
+        .select('*')
+        .or(roomFilter)
+        .order('created_at', { ascending: false })
+        .range(from, from + MESSAGE_PAGE_SIZE - 1);
+      if (error) throw error;
+
+      const page = (data || []).filter(m => new Date(m.created_at).getTime() > clearedTime);
+      messagesOffsetRef.current += data?.length || 0;
+      setHasOlderMessages((data?.length || 0) === MESSAGE_PAGE_SIZE);
+      if (page.length > 0) {
+        setMessages(prev => {
+          const existingIds = new Set(prev.map(m => m.id));
+          return [...prev, ...page.filter(m => !existingIds.has(m.id))];
+        });
+      }
+    } catch (error) {
+      console.warn('Erro ao carregar mensagens antigas:', error);
+    } finally {
+      loadingOlderMessagesRef.current = false;
+      setLoadingOlderMessages(false);
+    }
+  };
+
+  // Carrega uma janela em torno de uma mensagem antiga antes de navegar até ela.
+  // Assim a busca e as respostas nunca deixam uma mensagem solta entre as recentes.
+  const loadMessageContext = async (messageId) => {
+    const myCode = userCode.trim().toLowerCase();
+    const frCode = friendCode.trim().toLowerCase();
+    const roomFilter = isGroupChat
+      ? `receiver_code.eq.${frCode}`
+      : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
+    const { data: target, error: targetError } = await supabase
+      .from('mensagens')
+      .select('*')
+      .eq('id', messageId)
+      .or(roomFilter)
+      .maybeSingle();
+    if (targetError) throw targetError;
+    if (!target) return null;
+
+    const [newer, older] = await Promise.all([
+      supabase.from('mensagens').select('*').or(roomFilter).gt('created_at', target.created_at).order('created_at', { ascending: true }).limit(25),
+      supabase.from('mensagens').select('*').or(roomFilter).lt('created_at', target.created_at).order('created_at', { ascending: false }).limit(25)
+    ]);
+    if (newer.error) throw newer.error;
+    if (older.error) throw older.error;
+    const context = [target, ...(newer.data || []), ...(older.data || [])];
+    setMessages(prev => {
+      const byId = new Map(prev.map(message => [message.id, message]));
+      context.forEach(message => byId.set(message.id, message));
+      return Array.from(byId.values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    });
+    return context;
   };
 
   // 🚀 LÓGICA DE ROLAR ATÉ A MENSAGEM ORIGINAL (Como no WhatsApp)
-  const handleScrollToMessage = (messageId) => {
-    const dataList = [...pendingQueue, ...messages];
+  const handleScrollToMessage = async (messageId, ensureContext = false) => {
+    let loadedContext = null;
+    try {
+      if (ensureContext || ![...pendingQueue, ...messages].some(message => message.id === messageId)) {
+        loadedContext = await loadMessageContext(messageId);
+        // Aguarda o FlatList receber a janela de contexto antes de calcular o índice.
+        await new Promise(resolve => setTimeout(resolve, 80));
+      }
+    } catch (error) {
+      console.warn('Erro ao carregar contexto da mensagem:', error);
+    }
+    const contextualMessages = loadedContext
+      ? Array.from(new Map([...messages, ...loadedContext].map(message => [message.id, message])).values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      : messages;
+    const dataList = [...pendingQueueRef.current, ...contextualMessages];
     const index = dataList.findIndex(m => m.id === messageId);
     if (index !== -1) {
       try {
@@ -2370,11 +2610,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
   };
 
-  const searchResults = messageSearchQuery.trim().length > 0
-    ? [...pendingQueue, ...messages].filter(m => {
+  const searchResults = settledMessageSearchQuery.trim().length > 0
+    ? Array.from(new Map([
+        ...[...pendingQueue, ...messages].filter(m => {
         const searchableText = `${m.content || ''} ${m.media_type || ''}`.toLowerCase();
-        return searchableText.includes(messageSearchQuery.trim().toLowerCase());
-      })
+        return searchableText.includes(settledMessageSearchQuery.trim().toLowerCase());
+        }),
+        ...serverSearchResults
+      ].map(message => [message.id, message])).values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
     : [];
 
   const openMessageSearch = () => {
@@ -2386,6 +2629,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const closeMessageSearch = () => {
     setIsSearchMode(false);
     setMessageSearchQuery('');
+    setSettledMessageSearchQuery('');
+    setServerSearchResults([]);
     setSearchResultIndex(0);
     setHighlightedMessageId(null);
   };
@@ -2394,17 +2639,48 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     if (searchResults.length === 0) return;
     const nextIndex = (searchResultIndex + direction + searchResults.length) % searchResults.length;
     setSearchResultIndex(nextIndex);
-    handleScrollToMessage(searchResults[nextIndex].id);
+    handleScrollToMessage(searchResults[nextIndex].id, true);
   };
+
+  useEffect(() => {
+    const timer = setTimeout(() => setSettledMessageSearchQuery(messageSearchQuery), 450);
+    return () => clearTimeout(timer);
+  }, [messageSearchQuery]);
+
+  // A busca não fica limitada à página que já está na tela: depois da pausa na
+  // digitação ela consulta também o histórico do servidor e inclui os achados.
+  useEffect(() => {
+    const query = settledMessageSearchQuery.trim();
+    if (!query) return;
+    let cancelled = false;
+    const findInHistory = async () => {
+      const myCode = userCode.trim().toLowerCase();
+      const frCode = friendCode.trim().toLowerCase();
+      const roomFilter = isGroupChat
+        ? `receiver_code.eq.${frCode}`
+        : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
+      const { data, error } = await supabase
+        .from('mensagens')
+        .select('*')
+        .or(roomFilter)
+        .ilike('content', `%${query}%`)
+        .order('created_at', { ascending: false })
+        .limit(100);
+      if (cancelled || error) return;
+      setServerSearchResults(data || []);
+    };
+    findInHistory().catch(error => console.warn('Erro ao pesquisar mensagens:', error));
+    return () => { cancelled = true; };
+  }, [settledMessageSearchQuery, userCode, friendCode, isGroupChat, roomKey]);
 
   useEffect(() => {
     setSearchResultIndex(0);
     if (searchResults.length > 0) {
       const target = searchResults[0];
-      const timer = setTimeout(() => handleScrollToMessage(target.id), 120);
+      const timer = setTimeout(() => handleScrollToMessage(target.id, true), 80);
       return () => clearTimeout(timer);
     }
-  }, [messageSearchQuery]);
+  }, [settledMessageSearchQuery, searchResults.length]);
 
   const renderItem = useCallback(({ item, index }) => {
     const allData = [...pendingQueue, ...messages];
@@ -2414,7 +2690,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const isAiMessage = item.sender_code === AI_SENDER_CODE || item.media_type === 'ai';
     const isMyMessage = !isAiMessage && item.sender_code === userCode;
     const timeString = new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-    const quotedMsg = item.reply_to_id ? messages.find(m => m.id === item.reply_to_id) : null;
+    const quotedMsg = item.reply_to_id ? (messages.find(m => m.id === item.reply_to_id) || replyTargets[item.reply_to_id]) : null;
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
 
     // 🚀 LÓGICA DE SPOILER
@@ -2547,7 +2823,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       ]}
         >
           {quotedMsg && (
-            <TouchableOpacity activeOpacity={0.8} onPress={() => handleScrollToMessage(quotedMsg.id)}>
+            <TouchableOpacity activeOpacity={0.8} onPress={() => handleScrollToMessage(quotedMsg.id, true)}>
               <View style={styles.quoteInsideBubble}>
                 <Text style={styles.quoteInsideText} numberOfLines={1}>
                   {quotedMsg.media_url ? (quotedMsg.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : quotedMsg.content}
@@ -2624,6 +2900,17 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 </View>
               )}
               {renderMessageText(item.content, item.status === 'failed', isEmojiOnly)}
+              {!!item.link_url && (item.preview_title || item.preview_description || item.preview_image_url) && (
+                <TouchableOpacity style={styles.linkPreviewCard} activeOpacity={0.85} onPress={() => Linking.openURL(item.link_url).catch(() => toast('Não foi possível abrir o link.', { tone: 'error' }))}>
+                  {!!item.preview_image_url && <Image source={{ uri: item.preview_image_url }} style={styles.linkPreviewImage} />}
+                  <View style={styles.linkPreviewTextContainer}>
+                    {!!item.preview_site_name && <Text style={styles.linkPreviewSite} numberOfLines={1}>{item.preview_site_name}</Text>}
+                    {!!item.preview_title && <Text style={styles.linkPreviewTitle} numberOfLines={1}>{item.preview_title}</Text>}
+                    {!!item.preview_description && <Text style={styles.linkPreviewDesc} numberOfLines={1}>{item.preview_description}</Text>}
+                    <Text style={styles.linkPreviewUrl} numberOfLines={1}>{item.link_url}</Text>
+                  </View>
+                </TouchableOpacity>
+              )}
               <View style={[styles.bubbleFooter, isEmojiOnly && { backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 10, alignSelf: 'flex-end', marginTop: -5 }]}>
                 <Text style={[styles.messageTime, { color: isEmojiOnly ? '#fff' : timeColor }]}>{timeString}</Text>
                 {isMyMessage && statusIcon}
@@ -2677,9 +2964,10 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const showPrevButton = fullscreenMediaIndex > 0;
   const showNextButton = fullscreenMediaIndex < fullscreenMediaList.length - 1;
-  const sharedMedia = messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
-  const sharedDocuments = messages.filter(m => m.media_type === 'document');
-  const sharedLinks = messages.filter(m => !m.media_url && /https?:\/\/[^\s]+/i.test(m.content || ''));
+  const gallerySourceMessages = galleryMessages || messages;
+  const sharedMedia = gallerySourceMessages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
+  const sharedDocuments = gallerySourceMessages.filter(m => m.media_type === 'document');
+  const sharedLinks = gallerySourceMessages.filter(m => !m.media_url && /https?:\/\/[^\s]+/i.test(m.content || ''));
   const galleryItems = mediaGalleryTab === 'media' ? sharedMedia : (mediaGalleryTab === 'docs' ? sharedDocuments : sharedLinks);
 
   return (
@@ -2778,6 +3066,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               showsVerticalScrollIndicator={false}
               onScroll={handleScroll}
               scrollEventThrottle={16}
+              onEndReached={loadOlderMessages}
+              onEndReachedThreshold={0.35}
+              ListFooterComponent={loadingOlderMessages ? <ActivityIndicator size="small" color={DEFAULT_APP_THEME_COLOR} style={{ marginVertical: 14 }} /> : null}
               onScrollToIndexFailed={info => {
                 setTimeout(() => {
                   flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 });
@@ -2912,7 +3203,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               </View>
             ) : (
               <View style={styles.textInputContainer}>
-                <TextInput ref={textInputRef} style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} multiline maxLength={2000} />
+                <TextInput ref={textInputRef} style={styles.textInput} placeholder="Digite sua mensagem..." placeholderTextColor="#475569" value={inputText} onChangeText={handleTextChange} onFocus={() => onUserActivity?.()} multiline maxLength={2000} />
                 <TouchableOpacity onPress={() => { setGiphySearch(''); setGiphyTab('recent'); setGiphyModalVisible(true); }} style={styles.giphyBtnInside} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
                   <Ionicons name="happy-outline" size={26} color="#64748B" />
                 </TouchableOpacity>
@@ -2920,8 +3211,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             )}
             {recordedPreview ? (
               <TouchableOpacity style={styles.sendBtn} onPress={handleSendRecordedPreview}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
-            ) : inputText.trim().length > 0 ? (
-              <TouchableOpacity style={styles.sendBtn} onPress={handleSendMessage}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
+            ) : (inputText.trim().length > 0) ? (
+              <TouchableOpacity style={styles.sendBtn} onPress={handleSendComposer}><Ionicons name="send" size={18} color="#000" /></TouchableOpacity>
             ) : isRecording ? (
               <TouchableOpacity style={styles.sendBtn} onPress={stopRecording}><Ionicons name="checkmark" size={22} color="#000" /></TouchableOpacity>
             ) : (
@@ -3017,6 +3308,23 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                 {savingGroupDetails ? <ActivityIndicator color="#03150a" /> : <Text style={styles.groupDescriptionSaveText}>Salvar alterações</Text>}
               </TouchableOpacity>
             </View>
+            {isGroupChat && (
+              <View style={styles.groupInfoSection}>
+                <View style={styles.groupInfoSectionTitleRow}>
+                  <Ionicons name="people-outline" size={21} color={DEFAULT_APP_THEME_COLOR} />
+                  <Text style={styles.groupInfoSectionTitle}>Membros ({groupMembers.length})</Text>
+                </View>
+                {groupMembers.length > 0 ? groupMembers.map(member => (
+                  <View key={member.code} style={styles.groupMemberRow}>
+                    <View style={styles.groupMemberAvatar}><Text style={styles.groupMemberInitial}>{member.name.charAt(0).toUpperCase()}</Text></View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.groupMemberName}>{member.name}</Text>
+                      <Text style={styles.groupMemberCode}>{member.code}</Text>
+                    </View>
+                  </View>
+                )) : <Text style={styles.groupInfoHint}>Não foi possível carregar os membros.</Text>}
+              </View>
+            )}
           </ScrollView>
         </SafeAreaView>
       </Modal>
@@ -3300,7 +3608,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
             <View style={{ marginLeft: 12 }}>
               <Text style={styles.friendName}>Mídias Compartilhadas</Text>
               <Text style={styles.friendStatus}>
-                {messages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video'))).length} arquivos
+                {sharedMedia.length} arquivos
               </Text>
             </View>
           </View>
@@ -3332,7 +3640,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               </TouchableOpacity>
             )}
             ListEmptyComponent={() => (
-              <View style={{ flex: 1, alignItems: 'center', marginTop: 50 }}><Text style={{ color: '#475569' }}>Nenhuma mídia trocada.</Text></View>
+              <View style={{ flex: 1, alignItems: 'center', marginTop: 50 }}>
+                {loadingGalleryMessages ? <ActivityIndicator color={DEFAULT_APP_THEME_COLOR} /> : <Text style={{ color: '#475569' }}>Nenhuma mídia trocada.</Text>}
+              </View>
             )}
           />
         </SafeAreaView>
@@ -3548,6 +3858,11 @@ const styles = StyleSheet.create({
   groupInfoSection: { width: '100%', marginTop: 34, padding: 17, backgroundColor: '#0d0d0d', borderRadius: 16, borderWidth: 1, borderColor: '#1F2937' },
   groupInfoSectionTitleRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   groupInfoSectionTitle: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  groupMemberRow: { minHeight: 54, flexDirection: 'row', alignItems: 'center', gap: 11, borderBottomWidth: 1, borderBottomColor: '#1F2937' },
+  groupMemberAvatar: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(0,255,102,0.15)' },
+  groupMemberInitial: { color: '#00ff66', fontSize: 14, fontWeight: '800' },
+  groupMemberName: { color: '#fff', fontSize: 14, fontWeight: '700' },
+  groupMemberCode: { color: '#64748B', fontSize: 11, marginTop: 2 },
   groupInfoHint: { color: '#94a3b8', fontSize: 12, marginTop: 10, lineHeight: 17 },
   groupDescriptionInput: { minHeight: 112, maxHeight: 180, color: '#fff', backgroundColor: '#111827', borderRadius: 10, borderWidth: 1, borderColor: '#1F2937', padding: 12, fontSize: 15, marginTop: 14 },
   groupDescriptionCounter: { color: '#64748B', fontSize: 11, textAlign: 'right', marginTop: 5 },
@@ -3672,10 +3987,13 @@ const styles = StyleSheet.create({
   colorCircle: { width: 40, height: 40, borderRadius: 20, marginRight: 12, borderWidth: 2, borderColor: '#1F2937', justifyContent: 'center', alignItems: 'center' },
   colorCircleSelected: { borderColor: '#00ff66' },
   linkPreviewContainer: { backgroundColor: '#111827', borderRadius: 8, marginTop: 8, overflow: 'hidden', borderWidth: 1, borderColor: '#1F2937' },
-  linkPreviewImage: { width: '100%', height: 120, backgroundColor: '#1e293b' },
+  linkPreviewCard: { backgroundColor: 'rgba(0,0,0,0.22)', borderRadius: 10, marginTop: 9, overflow: 'hidden', borderWidth: 1, borderColor: 'rgba(255,255,255,0.14)' },
+  linkPreviewImage: { width: '100%', height: 220, backgroundColor: '#1e293b' },
   linkPreviewTextContainer: { padding: 10 },
-  linkPreviewTitle: { color: '#fff', fontSize: 14, fontWeight: 'bold', marginBottom: 4 },
-  linkPreviewDesc: { color: '#94A3B8', fontSize: 12 },
+  linkPreviewSite: { color: '#94a3b8', fontSize: 11, marginBottom: 4 },
+  linkPreviewTitle: { color: '#fff', fontSize: 13, fontWeight: '700', marginBottom: 3 },
+  linkPreviewDesc: { color: '#94A3B8', fontSize: 11 },
+  linkPreviewUrl: { color: '#7dd3fc', fontSize: 11, marginTop: 8 },
   scrollToBottomBtn: {
     position: 'absolute',
     bottom: 12,
