@@ -32,6 +32,7 @@ const DEFAULT_APP_THEME_COLOR = '#00ff66';
 const AI_DEFAULT_TIMEOUT_SECONDS = 35;
 const AI_DEFAULT_MAX_RETRIES = 2;
 const MESSAGE_PAGE_SIZE = 60;
+const SEARCH_PAGE_SIZE = 500;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const URL_PATTERN = /https?:\/\/[^\s<>()]+/i;
@@ -47,6 +48,53 @@ const getFirstValidHttpUrl = (text) => {
   } catch {
     return null;
   }
+};
+
+const getReplyPreviewText = (message) => {
+  if (!message) return 'Mensagem';
+  if (message.media_url) {
+    const mediaType = String(message.media_type || '').toLowerCase();
+    if (mediaType.includes('video')) return 'Vídeo';
+    if (mediaType === 'audio') return 'Áudio';
+    if (mediaType === 'document') return 'Documento';
+    if (mediaType === 'sticker') return 'Figurinha';
+    return 'Foto';
+  }
+  return message.preview_title || message.content || message.link_url || 'Mensagem';
+};
+
+const getLinkDomain = (url) => {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return 'Link'; }
+};
+
+const hasReplyThumbnail = (message) => {
+  if (!message) return false;
+  if (message.link_url) return true;
+  const mediaType = String(message.media_type || '').toLowerCase();
+  return mediaType.includes('image') || mediaType.includes('video');
+};
+
+const ReplyPreviewThumbnail = ({ message }) => {
+  if (!message) return null;
+  const mediaType = String(message.media_type || '').toLowerCase();
+  const isVideo = mediaType.includes('video');
+  const thumbnailUrl = message.media_url || message.preview_image_url;
+
+  if (thumbnailUrl && isVideo) {
+    return (
+      <View style={styles.replyThumbnail}>
+        <Video source={{ uri: thumbnailUrl }} style={StyleSheet.absoluteFill} resizeMode={ResizeMode.COVER} shouldPlay={false} isMuted />
+        <View style={styles.replyPlayIcon}><Ionicons name="play" size={11} color="#fff" /></View>
+      </View>
+    );
+  }
+  if (thumbnailUrl) return <Image source={{ uri: thumbnailUrl }} style={styles.replyThumbnail} resizeMode="cover" />;
+
+  return (
+    <View style={[styles.replyThumbnail, styles.replyThumbnailFallback]}>
+      <Ionicons name={message.link_url ? 'link-outline' : 'chatbubble-outline'} size={18} color="#cbd5e1" />
+    </View>
+  );
 };
 
 // 🚀 Sincronizador Global de Tempo (Proteção contra hora errada no celular)
@@ -294,6 +342,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [recentEmojis, setRecentEmojis] = useState(['👍', '❤️', '😂', '😮', '😢', '🙏']);
   const [friendLastSeen, setFriendLastSeen] = useState(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState(null);
+  const [scrollTarget, setScrollTarget] = useState(null);
   const [replyTargets, setReplyTargets] = useState({});
   const [isSearchMode, setIsSearchMode] = useState(false);
   const [messageSearchQuery, setMessageSearchQuery] = useState('');
@@ -303,6 +352,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [hasOlderMessages, setHasOlderMessages] = useState(true);
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const messageSearchInputRef = useRef(null);
+  const messageSearchRequestRef = useRef(0);
   const [renderKey, setRenderKey] = useState(0);
   const [pinnedMessage, setPinnedMessage] = useState(null);
 
@@ -634,6 +684,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   const flatListRef = useRef();
+  const scrollRequestRef = useRef(0);
   const channelRef = useRef(null);
   const messagesOffsetRef = useRef(0);
   const loadingOlderMessagesRef = useRef(false);
@@ -2582,38 +2633,49 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     return context;
   };
 
+  // Pede o salto e espera a FlatList renderizar a lista atual antes de calcular o índice.
+  // Isso evita que mensagens antigas recebam um índice de uma lista ainda desatualizada.
+  useEffect(() => {
+    if (!scrollTarget) return;
+    const dataList = [...pendingQueue, ...messages];
+    const index = dataList.findIndex(message => message.id === scrollTarget.id);
+    if (index === -1) return;
+
+    const requestId = scrollTarget.requestId;
+    const timer = setTimeout(() => {
+      if (scrollRequestRef.current !== requestId) return;
+      try {
+        flatListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
+      } catch (error) {
+        console.warn('Erro ao rolar para a mensagem:', error);
+      }
+      setHighlightedMessageId(scrollTarget.id);
+      setTimeout(() => setHighlightedMessageId(current => current === scrollTarget.id ? null : current), 1500);
+      setScrollTarget(current => current?.requestId === requestId ? null : current);
+    }, 80);
+    return () => clearTimeout(timer);
+  }, [scrollTarget, messages, pendingQueue]);
+
   // 🚀 LÓGICA DE ROLAR ATÉ A MENSAGEM ORIGINAL (Como no WhatsApp)
   const handleScrollToMessage = async (messageId, ensureContext = false) => {
-    let loadedContext = null;
+    const requestId = ++scrollRequestRef.current;
     try {
-      if (ensureContext || ![...pendingQueue, ...messages].some(message => message.id === messageId)) {
-        loadedContext = await loadMessageContext(messageId);
-        // Aguarda o FlatList receber a janela de contexto antes de calcular o índice.
-        await new Promise(resolve => setTimeout(resolve, 80));
-      }
+      const isLoaded = [...pendingQueueRef.current, ...messages].some(message => message.id === messageId);
+      // Não recarrega uma mensagem que já está na tela. Para uma mensagem antiga,
+      // busca o alvo e a janela ao redor dele antes de solicitar o salto.
+      if (!isLoaded) await loadMessageContext(messageId);
     } catch (error) {
       console.warn('Erro ao carregar contexto da mensagem:', error);
     }
-    const contextualMessages = loadedContext
-      ? Array.from(new Map([...messages, ...loadedContext].map(message => [message.id, message])).values()).sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
-      : messages;
-    const dataList = [...pendingQueueRef.current, ...contextualMessages];
-    const index = dataList.findIndex(m => m.id === messageId);
-    if (index !== -1) {
-      try {
-        flatListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
-      } catch (e) {
-        console.warn('Erro ao rolar para a mensagem:', e);
-      }
-      setHighlightedMessageId(messageId);
-      setTimeout(() => setHighlightedMessageId(null), 1500); // Tira o brilho depois de 1.5s
-    }
+    // Se o usuário tocou em outra resposta enquanto esta consulta terminava, ignoramos a antiga.
+    if (scrollRequestRef.current !== requestId) return;
+    setScrollTarget({ id: messageId, requestId, ensureContext });
   };
 
   const searchResults = settledMessageSearchQuery.trim().length > 0
     ? Array.from(new Map([
         ...[...pendingQueue, ...messages].filter(m => {
-        const searchableText = `${m.content || ''} ${m.media_type || ''}`.toLowerCase();
+        const searchableText = `${m.content || ''} ${m.link_url || ''} ${m.preview_title || ''} ${m.preview_description || ''} ${m.preview_site_name || ''} ${m.media_type || ''}`.toLowerCase();
         return searchableText.includes(settledMessageSearchQuery.trim().toLowerCase());
         }),
         ...serverSearchResults
@@ -2651,6 +2713,9 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   // digitação ela consulta também o histórico do servidor e inclui os achados.
   useEffect(() => {
     const query = settledMessageSearchQuery.trim();
+    const requestId = ++messageSearchRequestRef.current;
+    // Nunca misturamos os resultados da busca anterior com a nova enquanto ela carrega.
+    setServerSearchResults([]);
     if (!query) return;
     let cancelled = false;
     const findInHistory = async () => {
@@ -2659,15 +2724,30 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       const roomFilter = isGroupChat
         ? `receiver_code.eq.${frCode}`
         : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
-      const { data, error } = await supabase
-        .from('mensagens')
-        .select('*')
-        .or(roomFilter)
-        .ilike('content', `%${query}%`)
-        .order('created_at', { ascending: false })
-        .limit(100);
-      if (cancelled || error) return;
-      setServerSearchResults(data || []);
+      // A busca anterior usava limit(100), então as setas só conheciam os 100
+      // achados mais recentes. Buscamos todas as páginas para incluir o histórico.
+      const allResults = [];
+      let from = 0;
+      while (!cancelled && requestId === messageSearchRequestRef.current) {
+        const { data, error } = await supabase
+          .from('mensagens')
+          .select('*')
+          .or(roomFilter)
+          .ilike('content', `%${query}%`)
+          .order('created_at', { ascending: false })
+          .range(from, from + SEARCH_PAGE_SIZE - 1);
+
+        if (error) {
+          console.warn('Erro ao buscar mensagens no servidor:', error.message);
+          return;
+        }
+        const page = data || [];
+        allResults.push(...page);
+        if (page.length < SEARCH_PAGE_SIZE) break;
+        from += page.length;
+      }
+      if (cancelled || requestId !== messageSearchRequestRef.current) return;
+      setServerSearchResults(allResults);
     };
     findInHistory().catch(error => console.warn('Erro ao pesquisar mensagens:', error));
     return () => { cancelled = true; };
@@ -2691,6 +2771,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const isMyMessage = !isAiMessage && item.sender_code === userCode;
     const timeString = new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
     const quotedMsg = item.reply_to_id ? (messages.find(m => m.id === item.reply_to_id) || replyTargets[item.reply_to_id]) : null;
+    const quotedHasThumbnail = hasReplyThumbnail(quotedMsg);
     const rList = item.reacoes ? Object.values(item.reacoes).filter(Boolean) : [];
 
     // 🚀 LÓGICA DE SPOILER
@@ -2825,9 +2906,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           {quotedMsg && (
             <TouchableOpacity activeOpacity={0.8} onPress={() => handleScrollToMessage(quotedMsg.id, true)}>
               <View style={styles.quoteInsideBubble}>
-                <Text style={styles.quoteInsideText} numberOfLines={1}>
-                  {quotedMsg.media_url ? (quotedMsg.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : quotedMsg.content}
-                </Text>
+                <View style={styles.replyPreviewContent}>
+                  <View style={styles.replyPreviewText}>
+                    {quotedMsg.link_url && !quotedMsg.media_url && (
+                      <Text style={styles.quoteInsideLabel} numberOfLines={1}>{getLinkDomain(quotedMsg.link_url)}</Text>
+                    )}
+                    <Text style={styles.quoteInsideText} numberOfLines={1}>{getReplyPreviewText(quotedMsg)}</Text>
+                  </View>
+                  {quotedHasThumbnail && <ReplyPreviewThumbnail message={quotedMsg} />}
+                </View>
               </View>
             </TouchableOpacity>
           )}
@@ -3115,10 +3202,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         {replyingTo && (
           <View style={styles.replyBarContainer}>
             <View style={styles.replyBarLeft}>
-              <Text style={styles.replyUserTarget}>Respondendo</Text>
-              <Text style={styles.replyTextTarget} numberOfLines={1}>
-                {replyingTo.media_url ? (replyingTo.media_type === 'video' ? '📹 Vídeo' : '📷 Foto') : replyingTo.content}
-              </Text>
+              <View style={styles.replyPreviewContent}>
+                <View style={styles.replyPreviewText}>
+                  <Text style={styles.replyUserTarget}>{replyingTo.link_url && !replyingTo.media_url ? getLinkDomain(replyingTo.link_url) : 'Respondendo'}</Text>
+                  <Text style={styles.replyTextTarget} numberOfLines={1}>{getReplyPreviewText(replyingTo)}</Text>
+                </View>
+                {hasReplyThumbnail(replyingTo) && <ReplyPreviewThumbnail message={replyingTo} />}
+              </View>
             </View>
             <TouchableOpacity onPress={() => setReplyingTo(null)}><Ionicons name="close-circle" size={20} color="#ef4444" /></TouchableOpacity>
           </View>
@@ -3892,7 +3982,13 @@ const styles = StyleSheet.create({
   messageText: { color: '#fff', fontSize: 15, lineHeight: 21 },
   bubbleFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', marginTop: 4 },
   messageTime: { color: '#475569', fontSize: 10, fontFamily: 'monospace' },
-  quoteInsideBubble: { backgroundColor: 'rgba(0,0,0,0.3)', borderLeftWidth: 2, borderLeftColor: '#00ff66', padding: 6, borderRadius: 4, marginBottom: 6 },
+  quoteInsideBubble: { minWidth: 180, backgroundColor: 'rgba(0,0,0,0.3)', borderLeftWidth: 2, borderLeftColor: '#00ff66', padding: 6, borderRadius: 4, marginBottom: 6 },
+  replyPreviewContent: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  replyPreviewText: { flex: 1, minWidth: 0 },
+  replyThumbnail: { width: 42, height: 42, borderRadius: 6, backgroundColor: '#1e293b', overflow: 'hidden' },
+  replyThumbnailFallback: { alignItems: 'center', justifyContent: 'center' },
+  replyPlayIcon: { position: 'absolute', width: 22, height: 22, borderRadius: 11, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', paddingLeft: 1 },
+  quoteInsideLabel: { color: '#00ff66', fontSize: 11, fontWeight: '700', marginBottom: 1 },
   quoteInsideText: { color: '#94a3b8', fontSize: 12 },
   reactionBadge: { position: 'absolute', bottom: -10, backgroundColor: '#111827', borderWidth: 1, borderColor: '#1F2937', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 10, flexDirection: 'row', alignItems: 'center', minWidth: 24, justifyContent: 'center' },
   myBadgePos: { right: 10 },
@@ -3905,7 +4001,7 @@ const styles = StyleSheet.create({
   reactionRowBar: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', backgroundColor: '#0d0d0d', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 30, borderWidth: 1, borderColor: '#1F2937', gap: 14, elevation: 10 },
   reactionEmojiBtn: { padding: 4 },
   replyBarContainer: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#0d0d0d', paddingHorizontal: 16, paddingVertical: 10, borderTopWidth: 1, borderTopColor: '#1F2937' },
-  replyBarLeft: { borderLeftWidth: 3, borderLeftColor: '#00ff66', paddingLeft: 10, flex: 1 },
+  replyBarLeft: { borderLeftWidth: 3, borderLeftColor: '#00ff66', paddingLeft: 10, flex: 1, marginRight: 10 },
   replyUserTarget: { color: '#00ff66', fontSize: 12, fontWeight: 'bold' },
   replyTextTarget: { color: '#64748B', fontSize: 13, marginTop: 2 },
   inputWrapper: { borderTopWidth: 1, borderTopColor: '#111', paddingBottom: Platform.OS === 'ios' ? 10 : 48, paddingTop: 10 },
