@@ -33,6 +33,8 @@ const AI_DEFAULT_TIMEOUT_SECONDS = 35;
 const AI_DEFAULT_MAX_RETRIES = 2;
 const MESSAGE_PAGE_SIZE = 60;
 const SEARCH_PAGE_SIZE = 500;
+const MESSAGE_POLL_INTERVAL_MS = 15000;
+const GROUP_INFO_POLL_INTERVAL_MS = 30000;
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const URL_PATTERN = /https?:\/\/[^\s<>()]+/i;
@@ -1245,7 +1247,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
           });
         }
       } catch (err) { console.warn('Erro no polling:', err); }
-    }, 5000);
+    }, MESSAGE_POLL_INTERVAL_MS);
 
     channelRef.current = subscription;
     return () => {
@@ -1314,7 +1316,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       })
       .subscribe();
 
-    const groupPoll = setInterval(fetchGroupInfo, 5000);
+    const groupPoll = setInterval(fetchGroupInfo, GROUP_INFO_POLL_INTERVAL_MS);
     return () => {
       clearInterval(groupPoll);
       supabase.removeChannel(groupChannel);

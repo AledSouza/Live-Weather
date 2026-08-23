@@ -11,6 +11,7 @@ import { useToast } from '../components/Toast';
 
 const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
 const GROUP_PREFIX = 'group:';
+const CONVERSATIONS_POLL_INTERVAL_MS = 30000;
 const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
 const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
 const normalizeToken = (token) => String(token || '').trim().toLowerCase();
@@ -449,14 +450,20 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     } catch (e) {}
 
     try {
-      const { data: myConnections, error: connectionsError } = await withTimeout(supabase.from('conexoes').select('*').eq('user_code', myCleanCode));
+      const { data: myConnections, error: connectionsError } = await withTimeout(supabase
+        .from('conexoes')
+        .select('id, user_code, friend_code, friend_name, is_pinned')
+        .eq('user_code', myCleanCode));
       if (connectionsError) throw connectionsError;
       const { data: myGroupLinks, error: linksError } = await withTimeout(supabase.from('grupo_membros').select('group_id').eq('member_code', myCleanCode));
       if (linksError) throw linksError;
       const myGroupIds = (myGroupLinks || []).map(g => g.group_id);
       let myGroups = [];
       if (myGroupIds.length > 0) {
-        const { data: groupRows, error: groupsError } = await withTimeout(supabase.from('grupos').select('*').in('id', myGroupIds));
+        const { data: groupRows, error: groupsError } = await withTimeout(supabase
+          .from('grupos')
+          .select('id, name, photo_url, created_by')
+          .in('id', myGroupIds));
         if (groupsError) throw groupsError;
         myGroups = groupRows || [];
       }
@@ -635,7 +642,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       })
       .subscribe();
 
-    const groupPoll = setInterval(fetchMyConversations, 5000);
+    const groupPoll = setInterval(fetchMyConversations, CONVERSATIONS_POLL_INTERVAL_MS);
       
     return () => { 
       clearInterval(groupPoll);
