@@ -9,7 +9,7 @@ import { supabase } from '../supabase';
 import { registerForPushNotificationsAsync } from './notificationService';
 import { useToast } from '../components/Toast';
 
-const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
+const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
 const GROUP_PREFIX = 'group:';
 const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
 const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);

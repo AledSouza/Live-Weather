@@ -21,8 +21,8 @@ import { supabase } from '../supabase';
 import { sendWeatherNotification } from './notificationService';
 import { useToast } from '../components/Toast';
 
-const SUPABASE_URL = 'https://rzmhvinmavwgtglrhqmf.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ6bWh2aW5tYXZ3Z3RnbHJocW1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEwNTA0NTcsImV4cCI6MjA5NjYyNjQ1N30.Yp6w81vNORd7sKguYV7x6kl476KJoMbl5es1GdwjpLc';
+const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_pDknu1ErFeiEZemV2_Z8ng_MH0HQY3k';
 const AI_SENDER_CODE = 'gemini';
 const GROUP_PREFIX = 'group:';
 const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
