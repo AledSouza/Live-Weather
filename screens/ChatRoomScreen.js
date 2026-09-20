@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity,
+  View, Text, StyleSheet, FlatList, TextInput, TouchableOpacity, InteractionManager,
   SafeAreaView, ActivityIndicator, KeyboardAvoidingView, Platform, Linking,
   StatusBar, Modal, Image, Animated, PanResponder, useWindowDimensions, ScrollView,
   ImageBackground, Alert, BackHandler, Dimensions
@@ -20,60 +20,98 @@ import Slider from '@react-native-community/slider';
 import { supabase } from '../supabase';
 import { sendWeatherNotification } from './notificationService';
 import { useToast } from '../components/Toast';
-
-const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_pDknu1ErFeiEZemV2_Z8ng_MH0HQY3k';
-const AI_SENDER_CODE = 'gemini';
-const GROUP_PREFIX = 'group:';
-const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-const DEFAULT_AI_NAME = 'Gemini';
-const DEFAULT_APP_THEME_COLOR = '#00ff66';
-const AI_DEFAULT_TIMEOUT_SECONDS = 35;
-const AI_DEFAULT_MAX_RETRIES = 2;
-const MESSAGE_PAGE_SIZE = 60;
-const SEARCH_PAGE_SIZE = 500;
-const MESSAGE_POLL_INTERVAL_MS = 15000;
-const GROUP_INFO_POLL_INTERVAL_MS = 30000;
+import {
+  AI_DEFAULT_MAX_RETRIES,
+  AI_DEFAULT_TIMEOUT_SECONDS,
+  AI_SENDER_CODE,
+  DEFAULT_AI_NAME,
+  DEFAULT_APP_THEME_COLOR,
+  GEMINI_MODELS,
+  GROUP_INFO_POLL_INTERVAL_MS,
+  GROUP_PREFIX,
+  MESSAGE_PAGE_SIZE,
+  MESSAGE_POLL_INTERVAL_MS,
+  MESSAGE_SEARCH_DEBOUNCE_MS,
+  MIN_MESSAGE_SEARCH_LENGTH,
+  SEARCH_PAGE_SIZE,
+  SUPABASE_ANON_KEY,
+  SUPABASE_URL,
+  isGroupToken,
+} from '../modules/chat/constants';
+import {
+  extractStoragePath,
+  formatAudioMillis,
+  generateWaveformBars,
+  getDocumentIcon,
+  getFirstValidHttpUrl,
+  getLinkDomain,
+  getPinnedMessagePreview,
+  getReplyPreviewText,
+  hasReplyThumbnail,
+} from '../modules/chat/utils';
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const URL_PATTERN = /https?:\/\/[^\s<>()]+/i;
 const linkPreviewCache = new Map();
 const linkPreviewRequests = new Map();
 
-const getFirstValidHttpUrl = (text) => {
-  const match = String(text || '').match(URL_PATTERN);
+const decodeHtmlEntities = (value) => value
+  .replace(/&#x([0-9a-f]+);?/gi, (_, code) => {
+    try { return String.fromCodePoint(parseInt(code, 16)); } catch { return ''; }
+  })
+  .replace(/&#([0-9]+);?/g, (_, code) => {
+    try { return String.fromCodePoint(Number(code)); } catch { return ''; }
+  })
+  .replace(/(?:&amp;)*&?#x([0-9a-f]+);?/gi, (_, code) => {
+    try { return String.fromCodePoint(parseInt(code, 16)); } catch { return ''; }
+  })
+  .replace(/(?:&amp;)*&?#([0-9]+);?/g, (_, code) => {
+    try { return String.fromCodePoint(Number(code)); } catch { return ''; }
+  })
+  .replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+  .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>');
+
+const extractTextFromHtml = (html, pattern) => {
+  const match = html.match(pattern);
   if (!match) return null;
+  const text = match[1] || match[2] || '';
+  return decodeHtmlEntities(text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
+};
+
+const getPreviewFromHtmlFallback = async (url) => {
   try {
-    const url = new URL(match[0]);
-    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null;
-  } catch {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LiveWeather/1.0; +https://example.com)' }
+    });
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const title = extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']og:title["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:title["'][^>]*>/i)
+      || extractTextFromHtml(html, /<title[^>]*>([\s\S]*?)<\/title>/i);
+    const description = extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["'][^>]*>/i);
+    const imageUrl = extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:image["'][^>]*>/i);
+    const siteName = extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']og:site_name["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || extractTextFromHtml(html, /<meta[^>]+(?:property|name)=["']twitter:site["'][^>]+content=["']([^"']+)["'][^>]*>/i)
+      || new URL(url).hostname.replace(/^www\./, '');
+
+    if (!title && !description && !imageUrl) return null;
+
+    return {
+      url,
+      title: title || null,
+      description: description || null,
+      image_url: imageUrl || null,
+      site_name: siteName || null,
+    };
+  } catch (error) {
+    console.warn('Fallback local de preview falhou:', error?.message || error);
     return null;
   }
-};
-
-const getReplyPreviewText = (message) => {
-  if (!message) return 'Mensagem';
-  if (message.media_url) {
-    const mediaType = String(message.media_type || '').toLowerCase();
-    if (mediaType.includes('video')) return 'Vídeo';
-    if (mediaType === 'audio') return 'Áudio';
-    if (mediaType === 'document') return 'Documento';
-    if (mediaType === 'sticker') return 'Figurinha';
-    return 'Foto';
-  }
-  return message.preview_title || message.content || message.link_url || 'Mensagem';
-};
-
-const getLinkDomain = (url) => {
-  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return 'Link'; }
-};
-
-const hasReplyThumbnail = (message) => {
-  if (!message) return false;
-  if (message.link_url) return true;
-  const mediaType = String(message.media_type || '').toLowerCase();
-  return mediaType.includes('image') || mediaType.includes('video');
 };
 
 const ReplyPreviewThumbnail = ({ message }) => {
@@ -129,77 +167,6 @@ const syncTimeWithServer = async () => {
   } catch (e) { console.warn('Falha na sincronização de tempo', e); }
 };
 const getSyncedTime = () => Date.now() + globalTimeOffset;
-
-// ✅ Extrai o path real do arquivo relativo ao bucket
-const extractStoragePath = (url) => {
-  try {
-    const marker = '/object/public/chat-media/';
-    const idx = url.indexOf(marker);
-    if (idx === -1) return null;
-    return decodeURIComponent(url.slice(idx + marker.length).split('?')[0]);
-  } catch {
-    return null;
-  }
-};
-
-// 🚀 Mapeia a extensão do arquivo para um ícone específico
-const getDocumentIcon = (content) => {
-  const filename = (content || '|').split('|')[0].toLowerCase();
-  const ext = filename.split('.').pop();
-
-  if (['mp3', 'wav', 'm4a', 'ogg', 'aac'].includes(ext)) {
-    return 'musical-notes-outline';
-  }
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) {
-    return 'archive-outline';
-  }
-  if (ext === 'pdf') {
-    return 'book-outline';
-  }
-  return 'document-text-outline';
-};
-
-// 🚀 Formata milissegundos em MM:SS (usado pelo player de áudio)
-const formatAudioMillis = (millis) => {
-  if (!millis) return '0:00';
-  const totalSeconds = Math.floor(millis / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
-};
-
-const getPinnedMessagePreview = (message) => {
-  if (!message) return '';
-  if (!message.media_url) return message.content || 'Mensagem';
-
-  const mediaType = String(message.media_type || '').toLowerCase();
-  if (mediaType.includes('spoiler')) return 'Midia com spoiler';
-  if (mediaType === 'audio') return 'Audio';
-  if (mediaType === 'video') return 'Video';
-  if (mediaType === 'document') return 'Documento';
-  if (mediaType === 'sticker') return 'Sticker';
-  return 'Foto';
-};
-
-// 🚀 Gera um padrão de "forma de onda" decorativo e determinístico a partir do id da mensagem.
-// Não reflete o áudio real (não temos acesso à amplitude), mas dá o visual estilo WhatsApp
-// e é sempre igual para a mesma mensagem (não "pisca" trocando de forma a cada render).
-const generateWaveformBars = (seed, count = 27) => {
-  const str = String(seed || 'default');
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash * 31 + str.charCodeAt(i)) & 0xffffffff;
-  }
-  let currentSeed = Math.abs(hash) || 1;
-  const bars = [];
-  for (let i = 0; i < count; i++) {
-    // Gerador pseudo-aleatório simples e determinístico (LCG)
-    currentSeed = (currentSeed * 1103515245 + 12345) & 0x7fffffff;
-    const normalized = (currentSeed % 100) / 100; // 0 a 1
-    bars.push(4 + Math.round(normalized * 16)); // Altura entre 4 e 20
-  }
-  return bars;
-};
 
 // 🚀 COMPONENTE DO PLAYER DE ÁUDIO — visual estilo WhatsApp (botão circular + "forma de onda")
 // Extraído para fora do componente principal e recebendo tudo via props: assim ele sempre
@@ -291,7 +258,7 @@ const SwipeableMessage = ({ children, onReply }) => {
   );
 };
 
-export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive, onUserActivity }) {
+export default function ChatRoomScreen({ onBack, userCode, friendCode, friendName, setPickerActive, onUserActivity, privacyBypassEnabled, onTogglePrivacyBypass }) {
   const toast = useToast();
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
@@ -376,6 +343,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [emojiSuggestions, setEmojiSuggestions] = useState([]);
   const [showEmojiSuggestions, setShowEmojiSuggestions] = useState(false);
   const emojiSuggestionTimeout = useRef(null);
+  const emojiSuggestionOffsetRef = useRef(0);
+  const emojiSuggestionSearchRef = useRef('');
+  const emojiSuggestionLoadingRef = useRef(false);
+  const emojiSuggestionHasMoreRef = useRef(true);
+  const emojiSuggestionRequestRef = useRef(0);
 
   // 🚀 ESTADOS DO NOVO MODAL DE AÇÃO DE STICKER (Estilo WhatsApp)
   const [stickerActionModalVisible, setStickerActionModalVisible] = useState(false);
@@ -687,6 +659,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const flatListRef = useRef();
   const scrollRequestRef = useRef(0);
+  const scrollRetryRef = useRef(null);
+  const scrollRetryCountRef = useRef(0);
   const channelRef = useRef(null);
   const messagesOffsetRef = useRef(0);
   const loadingOlderMessagesRef = useRef(false);
@@ -739,10 +713,42 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         if (savedEmojis) setRecentEmojis(JSON.parse(savedEmojis));
 
         const savedGifs = await AsyncStorage.getItem('@recent_gifs');
-        if (savedGifs) setRecentGifs(JSON.parse(savedGifs));
-
         const savedFavs = await AsyncStorage.getItem('@favorite_gifs'); // 🚀 Carrega favoritos
-        if (savedFavs) setFavoriteGifs(JSON.parse(savedFavs));
+        const localRecentGifs = savedGifs ? JSON.parse(savedGifs) : [];
+        const localFavoriteGifs = savedFavs ? JSON.parse(savedFavs) : [];
+
+        const [profileResult, stickerResult] = await Promise.all([
+          supabase
+            .from('perfis')
+            .select('favorite_gifs')
+            .eq('connection_code', userCode.trim().toLowerCase())
+            .maybeSingle(),
+          supabase
+            .from('mensagens')
+            .select('media_url')
+            .eq('sender_code', userCode.trim().toLowerCase())
+            .eq('media_type', 'sticker')
+            .not('media_url', 'is', null)
+            .order('created_at', { ascending: false })
+            .limit(60),
+        ]);
+
+        const cloudFavoriteGifs = !profileResult.error && Array.isArray(profileResult.data?.favorite_gifs)
+          ? profileResult.data.favorite_gifs.filter(Boolean)
+          : [];
+        const mergedFavoriteGifs = [...new Set([...cloudFavoriteGifs, ...localFavoriteGifs])];
+        setFavoriteGifs(mergedFavoriteGifs);
+        AsyncStorage.setItem('@favorite_gifs', JSON.stringify(mergedFavoriteGifs)).catch(() => {});
+        if (!profileResult.error && mergedFavoriteGifs.length !== cloudFavoriteGifs.length) {
+          supabase.from('perfis').update({ favorite_gifs: mergedFavoriteGifs })
+            .eq('connection_code', userCode.trim().toLowerCase())
+            .then(() => {});
+        }
+
+        const cloudRecentGifs = !stickerResult.error
+          ? (stickerResult.data || []).map(message => message.media_url).filter(Boolean)
+          : [];
+        setRecentGifs([...new Set([...cloudRecentGifs, ...localRecentGifs])].slice(0, 60));
       } catch (e) { console.error(e); }
     };
     initializeChatState();
@@ -864,6 +870,11 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
     setFavoriteGifs(updated);
     await AsyncStorage.setItem('@favorite_gifs', JSON.stringify(updated));
+    const { error } = await supabase
+      .from('perfis')
+      .update({ favorite_gifs: updated })
+      .eq('connection_code', userCode.trim().toLowerCase());
+    if (error) console.warn('Nao foi possivel sincronizar favoritos:', error.message);
   };
 
   // 🚀 Abre o modal de ação ao clicar em um sticker
@@ -873,6 +884,41 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     setStickerActionModalVisible(true);
   };
 
+  const loadEmojiSuggestions = (searchTerm, reset = false) => {
+    if (emojiSuggestionLoadingRef.current && !reset) return;
+    if (!reset && !emojiSuggestionHasMoreRef.current) return;
+
+    const requestId = reset ? emojiSuggestionRequestRef.current + 1 : emojiSuggestionRequestRef.current;
+    const currentOffset = reset ? 0 : emojiSuggestionOffsetRef.current;
+    if (reset) {
+      emojiSuggestionRequestRef.current = requestId;
+      emojiSuggestionSearchRef.current = searchTerm;
+      emojiSuggestionOffsetRef.current = 0;
+      emojiSuggestionHasMoreRef.current = true;
+    }
+
+    emojiSuggestionLoadingRef.current = true;
+    fetch(`https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(searchTerm)}&limit=10&offset=${currentOffset}&rating=pg`)
+      .then(res => res.json())
+      .then(data => {
+        if (requestId !== emojiSuggestionRequestRef.current || searchTerm !== emojiSuggestionSearchRef.current) return;
+        const newResults = data.data || [];
+        setEmojiSuggestions(prev => {
+          if (reset) return newResults;
+          const existingIds = new Set(prev.map(gif => gif.id));
+          return [...prev, ...newResults.filter(gif => !existingIds.has(gif.id))];
+        });
+        emojiSuggestionOffsetRef.current = currentOffset + newResults.length;
+        emojiSuggestionHasMoreRef.current = newResults.length === 10;
+      })
+      .catch(() => {
+        if (requestId === emojiSuggestionRequestRef.current) emojiSuggestionHasMoreRef.current = false;
+      })
+      .finally(() => {
+        emojiSuggestionLoadingRef.current = false;
+      });
+  };
+
   const fetchEmojiSuggestions = (text) => {
     const emojiRegex = /[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]/gu;
     const emojis = text.match(emojiRegex);
@@ -880,6 +926,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     if (!emojis || text.replace(emojiRegex, '').trim().length > 0) {
       setShowEmojiSuggestions(false);
       setEmojiSuggestions([]);
+      emojiSuggestionRequestRef.current += 1;
+      emojiSuggestionHasMoreRef.current = false;
       return;
     }
 
@@ -889,13 +937,12 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const emojiMap = { '😂': 'laughing', '👍': 'thumbs up', '❤️': 'heart', '😢': 'crying', '🙏': 'praying', '🎉': 'party', '😊': 'smile', '🤔': 'thinking', '🤯': 'mind blown', '🔥': 'fire' };
     const lastEmoji = emojis[emojis.length - 1];
     const searchTerm = emojiMap[lastEmoji] || lastEmoji;
+    emojiSuggestionSearchRef.current = searchTerm;
+    emojiSuggestionRequestRef.current += 1;
 
     if (emojiSuggestionTimeout.current) clearTimeout(emojiSuggestionTimeout.current);
     emojiSuggestionTimeout.current = setTimeout(() => {
-      fetch(`https://api.giphy.com/v1/gifs/search?api_key=${GIPHY_API_KEY}&q=${encodeURIComponent(searchTerm)}&limit=10&rating=pg`)
-        .then(res => res.json())
-        .then(data => setEmojiSuggestions(data.data || []))
-        .catch(() => setEmojiSuggestions([]));
+      loadEmojiSuggestions(searchTerm, true);
     }, 300);
   };
 
@@ -1111,19 +1158,28 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         const roomFilter = isGroupChat
           ? `receiver_code.eq.${frCode}`
           : `and(sender_code.eq.${myCode},receiver_code.eq.${frCode}),and(sender_code.eq.${frCode},receiver_code.eq.${myCode}),and(sender_code.eq.${AI_SENDER_CODE},receiver_code.eq.${roomKey})`;
-        const { data, error } = await supabase
-          .from('mensagens')
-          .select('*')
-          .or(roomFilter)
-          .order('created_at', { ascending: false })
-          .range(0, MESSAGE_PAGE_SIZE - 1);
+        const allData = [];
+        for (let from = 0; ; from += MESSAGE_PAGE_SIZE) {
+          const { data, error } = await supabase
+            .from('mensagens')
+            .select('*')
+            .or(roomFilter)
+            .order('created_at', { ascending: false })
+            .range(from, from + MESSAGE_PAGE_SIZE - 1);
+          if (error) throw error;
+          allData.push(...(data || []));
+          if (!data || data.length < MESSAGE_PAGE_SIZE) break;
+        }
 
-        if (!error) {
-          const filteredData = (data || []).filter(m => new Date(m.created_at).getTime() > clearedTime);
+        {
+          const filteredData = allData.filter(m => new Date(m.created_at).getTime() > clearedTime);
           setMessages(filteredData);
-          messagesOffsetRef.current = data?.length || 0;
-          setHasOlderMessages((data?.length || 0) === MESSAGE_PAGE_SIZE);
+          messagesOffsetRef.current = allData.length;
+          setHasOlderMessages(false);
           AsyncStorage.setItem(`@cache_msgs_${userCode}_${friendCode}`, JSON.stringify(filteredData.slice(0, 60))).catch(() => {});
+          filteredData
+            .filter(message => !message.media_url && message.content && !(message.link_url || message.preview_title || message.preview_description || message.preview_image_url || message.preview_site_name))
+            .forEach(message => requestAndSaveLinkPreview(message));
           marcarComoLidas();
         }
       } catch (err) { console.error(err); } finally { setLoading(false); }
@@ -1472,24 +1528,40 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
 
   const requestAndSaveLinkPreview = useCallback(async (message) => {
     if (!message?.id || message.media_url) return;
-    const url = getFirstValidHttpUrl(message.content);
+
+    const url = getFirstValidHttpUrl(message.content || message.link_url || '');
     if (!url) return;
+
+    const alreadyHasPreview = !!(
+      message.link_url ||
+      message.preview_title ||
+      message.preview_description ||
+      message.preview_image_url ||
+      message.preview_site_name
+    );
+    if (alreadyHasPreview && message.link_url) return;
 
     let preview = linkPreviewCache.get(url);
     if (preview === undefined) {
       let request = linkPreviewRequests.get(url);
       if (!request) {
-        request = supabase.functions
-          .invoke('link-preview', { body: { url } })
-          .then(({ data, error }) => {
+        request = (async () => {
+          try {
+            const { data, error } = await supabase.functions.invoke('link-preview', { body: { url } });
             if (error) throw error;
-            return data?.preview || null;
-          })
-          .catch((error) => {
+            if (data?.preview) return data.preview;
+          } catch (error) {
             console.warn('Prévia de link indisponível:', error?.message || error);
+          }
+
+          try {
+            return await getPreviewFromHtmlFallback(url);
+          } catch (error) {
+            console.warn('Fallback local falhou:', error?.message || error);
             return null;
-          })
-          .finally(() => linkPreviewRequests.delete(url));
+          }
+        })().finally(() => linkPreviewRequests.delete(url));
+
         linkPreviewRequests.set(url, request);
       }
       preview = await request;
@@ -1497,6 +1569,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     }
 
     if (!preview) return;
+
     const previewFields = {
       link_url: preview.url || url,
       preview_title: preview.title || null,
@@ -1504,11 +1577,13 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       preview_image_url: preview.image_url || null,
       preview_site_name: preview.site_name || null,
     };
+
     const { error } = await supabase.from('mensagens').update(previewFields).eq('id', message.id);
     if (error) {
       console.warn('Não foi possível gravar prévia do link:', error.message);
       return;
     }
+
     setMessages(prev => prev.map(item => item.id === message.id ? { ...item, ...previewFields } : item));
   }, []);
 
@@ -2644,7 +2719,8 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     if (index === -1) return;
 
     const requestId = scrollTarget.requestId;
-    const timer = setTimeout(() => {
+    scrollRetryCountRef.current = 0;
+    const scrollToTarget = () => {
       if (scrollRequestRef.current !== requestId) return;
       try {
         flatListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
@@ -2654,8 +2730,14 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       setHighlightedMessageId(scrollTarget.id);
       setTimeout(() => setHighlightedMessageId(current => current === scrollTarget.id ? null : current), 1500);
       setScrollTarget(current => current?.requestId === requestId ? null : current);
-    }, 80);
-    return () => clearTimeout(timer);
+    };
+    const interaction = InteractionManager.runAfterInteractions(() => {
+      scrollRetryRef.current = setTimeout(scrollToTarget, 120);
+    });
+    return () => {
+      interaction.cancel();
+      if (scrollRetryRef.current) clearTimeout(scrollRetryRef.current);
+    };
   }, [scrollTarget, messages, pendingQueue]);
 
   // 🚀 LÓGICA DE ROLAR ATÉ A MENSAGEM ORIGINAL (Como no WhatsApp)
@@ -2665,7 +2747,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       const isLoaded = [...pendingQueueRef.current, ...messages].some(message => message.id === messageId);
       // Não recarrega uma mensagem que já está na tela. Para uma mensagem antiga,
       // busca o alvo e a janela ao redor dele antes de solicitar o salto.
-      if (!isLoaded) await loadMessageContext(messageId);
+      if (ensureContext || !isLoaded) await loadMessageContext(messageId);
     } catch (error) {
       console.warn('Erro ao carregar contexto da mensagem:', error);
     }
@@ -2707,7 +2789,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   };
 
   useEffect(() => {
-    const timer = setTimeout(() => setSettledMessageSearchQuery(messageSearchQuery), 450);
+    const timer = setTimeout(() => setSettledMessageSearchQuery(messageSearchQuery), MESSAGE_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [messageSearchQuery]);
 
@@ -2718,7 +2800,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
     const requestId = ++messageSearchRequestRef.current;
     // Nunca misturamos os resultados da busca anterior com a nova enquanto ela carrega.
     setServerSearchResults([]);
-    if (!query) return;
+    if (query.length < MIN_MESSAGE_SEARCH_LENGTH) return;
     let cancelled = false;
     const findInHistory = async () => {
       const myCode = userCode.trim().toLowerCase();
@@ -2762,7 +2844,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
       const timer = setTimeout(() => handleScrollToMessage(target.id, true), 80);
       return () => clearTimeout(timer);
     }
-  }, [settledMessageSearchQuery, searchResults.length]);
+  }, [settledMessageSearchQuery, searchResults.length, searchResults[0]?.id]);
 
   const renderItem = useCallback(({ item, index }) => {
     const allData = [...pendingQueue, ...messages];
@@ -3056,7 +3138,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const gallerySourceMessages = galleryMessages || messages;
   const sharedMedia = gallerySourceMessages.filter(m => m.media_url && (m.media_type?.startsWith('image') || m.media_type?.startsWith('video')));
   const sharedDocuments = gallerySourceMessages.filter(m => m.media_type === 'document');
-  const sharedLinks = gallerySourceMessages.filter(m => !m.media_url && /https?:\/\/[^\s]+/i.test(m.content || ''));
+  const sharedLinks = gallerySourceMessages.filter(m => !m.media_url && (m.link_url || /https?:\/\/[^\s]+/i.test(m.content || '')));
   const galleryItems = mediaGalleryTab === 'media' ? sharedMedia : (mediaGalleryTab === 'docs' ? sharedDocuments : sharedLinks);
 
   return (
@@ -3078,6 +3160,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               {showBlueTicks && friendLastSeen ? `${friendCode} • ${formatLastSeen(friendLastSeen)}` : friendCode}
             </Text>
           </View>
+
+          <TouchableOpacity
+            onPress={onTogglePrivacyBypass}
+            style={[styles.menuBtn, privacyBypassEnabled && styles.privacyBypassActive]}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            accessibilityLabel={privacyBypassEnabled ? 'Ativar privacidade' : 'Desativar privacidade temporariamente'}
+          >
+            <Ionicons name={privacyBypassEnabled ? 'eye-off-outline' : 'eye-outline'} size={20} color={privacyBypassEnabled ? '#22c55e' : DEFAULT_APP_THEME_COLOR} />
+          </TouchableOpacity>
 
           <TouchableOpacity onPress={openMessageSearch} style={styles.menuBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
             <Ionicons name="search-outline" size={20} color={DEFAULT_APP_THEME_COLOR} />
@@ -3159,9 +3250,15 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
               onEndReachedThreshold={0.35}
               ListFooterComponent={loadingOlderMessages ? <ActivityIndicator size="small" color={DEFAULT_APP_THEME_COLOR} style={{ marginVertical: 14 }} /> : null}
               onScrollToIndexFailed={info => {
-                setTimeout(() => {
+                if (scrollRetryRef.current) clearTimeout(scrollRetryRef.current);
+                if (scrollRetryCountRef.current >= 6) return;
+                scrollRetryCountRef.current += 1;
+                // Primeiro aproxima a janela virtualizada; só depois tenta o índice exato.
+                const estimatedOffset = Math.max(0, (info.averageItemLength || 72) * info.index);
+                flatListRef.current?.scrollToOffset({ offset: estimatedOffset, animated: false });
+                scrollRetryRef.current = setTimeout(() => {
                   flatListRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.5 });
-                }, 300);
+                }, 180);
               }}
             />
           )}
@@ -3182,7 +3279,16 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
         {/* 🚀 Janela de Sugestão de Stickers por Emoji */}
         {showEmojiSuggestions && (
           <View style={styles.suggestionContainer}>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 10 }}>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              contentContainerStyle={{ paddingHorizontal: 10 }}
+              scrollEventThrottle={16}
+              onScroll={({ nativeEvent }) => {
+                const distanceFromEnd = nativeEvent.contentSize.width - (nativeEvent.contentOffset.x + nativeEvent.layoutMeasurement.width);
+                if (distanceFromEnd < 180) loadEmojiSuggestions(emojiSuggestionSearchRef.current);
+              }}
+            >
               {emojiSuggestions.map(gif => (
                 <TouchableOpacity
                   key={gif.id}
@@ -3197,6 +3303,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
                   <Image source={{ uri: gif.images.fixed_width.url }} style={styles.suggestionImage} />
                 </TouchableOpacity>
               ))}
+              {emojiSuggestionLoadingRef.current && <ActivityIndicator size="small" color={DEFAULT_APP_THEME_COLOR} style={{ marginHorizontal: 12 }} />}
             </ScrollView>
           </View>
         )}
@@ -3927,6 +4034,7 @@ const styles = StyleSheet.create({
   chatHeader: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 15, paddingVertical: 10, backgroundColor: '#0d0d0d', borderBottomWidth: 1, borderBottomColor: '#111', minHeight: 65 },
   backBtn: { paddingRight: 12 },
   menuBtn: { padding: 5 },
+  privacyBypassActive: { backgroundColor: 'rgba(34, 197, 94, 0.14)', borderRadius: 14 },
   headerInfo: { flex: 1, minWidth: 0, justifyContent: 'center' },
   friendName: { color: '#fff', fontSize: 16, fontWeight: 'bold' },
   friendStatus: { color: '#64748B', fontSize: 11, marginTop: 2 },

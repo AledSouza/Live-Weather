@@ -10,6 +10,14 @@ import { registerForPushNotificationsAsync } from './screens/notificationService
 const GROUP_PREFIX = 'group:';
 const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
 
+const registerTerminalAccess = (connectionCode) => {
+  const cleanCode = String(connectionCode || '').trim().toLowerCase();
+  if (!cleanCode) return;
+  supabase.from('logs_acesso').insert({ connection_code: cleanCode }).then(({ error }) => {
+    if (error) console.warn('Erro ao registrar acesso do terminal:', error.message);
+  });
+};
+
 // Telas do ecossistema
 import WeatherScreen from './screens/WeatherScreen';
 import ChatListScreen from './screens/ChatListScreen';
@@ -24,7 +32,10 @@ function AppShell() {
   const INACTIVITY_TIMEOUT_MS = 3.5 * 60 * 1000;
   const [isChatMode, setIsChatMode] = useState(false);
   const [currentScreen, setCurrentScreen] = useState('gateway'); // 'gateway', 'list', 'room'
+  const [chatListRefreshKey, setChatListRefreshKey] = useState(0);
   const [nickname, setNickname] = useState('');
+  const [restoreCode, setRestoreCode] = useState('');
+  const [restoreMode, setRestoreMode] = useState(false);
   const [connectionCode, setConnectionCode] = useState(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -39,6 +50,8 @@ function AppShell() {
   const [pinValue, setPinValue] = useState('');
   const [savedPin, setSavedPin] = useState(null);
   const [failedAttempts, setFailedAttempts] = useState(0);
+  const [privacyBypassEnabled, setPrivacyBypassEnabled] = useState(false);
+  const privacyBypassRef = useRef(false);
 
   // ✅ Extrai o path real do arquivo relativo ao bucket
   const extractStoragePath = (url) => {
@@ -80,7 +93,7 @@ function AppShell() {
       try {
         const savedCode = await AsyncStorage.getItem('@connection_code');
         if (nextAppState === 'background' || nextAppState === 'inactive') {
-          if (!isPickerActiveRef.current) {
+          if (!isPickerActiveRef.current && !privacyBypassRef.current) {
             setIsChatMode(false);
           }
           // 🚀 Salva o "Visto por último" ao minimizar/fechar o app
@@ -100,12 +113,17 @@ function AppShell() {
       try {
         const savedName = await AsyncStorage.getItem('@user_nickname');
         const savedCode = await AsyncStorage.getItem('@connection_code');
+        const savedPrivacyBypass = await AsyncStorage.getItem('@privacy_bypass_enabled');
+        const privacyBypass = savedPrivacyBypass === 'true';
+        privacyBypassRef.current = privacyBypass;
+        setPrivacyBypassEnabled(privacyBypass);
         
         if (savedName && savedCode) {
           setNickname(savedName);
           const cleanCode = savedCode.trim().toLowerCase();
           setConnectionCode(cleanCode);
           setCurrentScreen('list'); 
+          registerTerminalAccess(cleanCode);
 
           // 🚀 ATUALIZA O TOKEN DE NOTIFICAÇÃO NO SUPABASE AO ABRIR O APP
           try {
@@ -284,6 +302,14 @@ function AppShell() {
     } else setIsChatMode(true);
   };
 
+  const handleTogglePrivacyBypass = useCallback(async () => {
+    const nextValue = !privacyBypassRef.current;
+    privacyBypassRef.current = nextValue;
+    setPrivacyBypassEnabled(nextValue);
+    await AsyncStorage.setItem('@privacy_bypass_enabled', String(nextValue));
+    toast(nextValue ? 'Privacidade temporariamente desativada.' : 'Privacidade ativada novamente.');
+  }, [toast]);
+
   const handleSaveIdentity = async () => {
     if (nickname.trim() === '') return;
     setSyncing(true);
@@ -319,9 +345,42 @@ function AppShell() {
       
       setConnectionCode(generatedCode);
       setCurrentScreen('list'); 
+      registerTerminalAccess(generatedCode);
       Keyboard.dismiss();
     } catch (e) {
       console.error(e);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleRestoreIdentity = async () => {
+    const cleanCode = restoreCode.trim().toLowerCase();
+    if (!cleanCode) return;
+    setSyncing(true);
+    try {
+      const { data, error } = await supabase
+        .from('perfis')
+        .select('nickname, connection_code')
+        .eq('connection_code', cleanCode)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) {
+        toast('Codigo de terminal nao encontrado.', { tone: 'error' });
+        return;
+      }
+
+      await AsyncStorage.setItem('@user_nickname', data.nickname);
+      await AsyncStorage.setItem('@connection_code', data.connection_code);
+      setNickname(data.nickname);
+      setConnectionCode(data.connection_code);
+      setCurrentScreen('list');
+      registerTerminalAccess(data.connection_code);
+      Keyboard.dismiss();
+    } catch (error) {
+      console.error('Erro ao restaurar terminal:', error);
+      toast('Nao foi possivel restaurar este terminal.', { tone: 'error' });
     } finally {
       setSyncing(false);
     }
@@ -337,8 +396,13 @@ function AppShell() {
             friendCode={activeFriendCode}
             friendName={activeFriendName}
             setPickerActive={(val) => { isPickerActiveRef.current = val; }}
-            onBack={() => setCurrentScreen('list')}
+            onBack={() => {
+              setChatListRefreshKey(value => value + 1);
+              setCurrentScreen('list');
+            }}
             onUserActivity={resetInactivityTimer}
+            privacyBypassEnabled={privacyBypassEnabled}
+            onTogglePrivacyBypass={handleTogglePrivacyBypass}
           />
         );
       }
@@ -356,6 +420,7 @@ function AppShell() {
               setActiveFriendName(name);
               setCurrentScreen('room');
             }}
+            refreshKey={chatListRefreshKey}
           />
         );
       }
@@ -370,13 +435,20 @@ function AppShell() {
             </TouchableOpacity>
           </View>
           <View style={styles.chatCenter}>
-            <Text style={styles.secretTitle}>CANAL ANÔNIMO</Text>
+            <Text style={styles.secretTitle}>{restoreMode ? 'RESTAURAR TERMINAL' : 'CANAL ANÔNIMO'}</Text>
             <View style={styles.inputCard}>
-              <Text style={styles.cardLabel}>Como deseja ser chamado no chat?</Text>
-              <TextInput style={styles.textInput} placeholder="Digite seu apelido" placeholderTextColor="#475569" value={nickname} onChangeText={setNickname} maxLength={20} editable={!syncing} />
+              <Text style={styles.cardLabel}>{restoreMode ? 'Informe o codigo do terminal anterior.' : 'Como deseja ser chamado no chat?'}</Text>
+              {restoreMode ? (
+                <TextInput style={styles.textInput} placeholder="Ex.: ab12-cd34" placeholderTextColor="#475569" value={restoreCode} onChangeText={setRestoreCode} autoCapitalize="none" autoCorrect={false} editable={!syncing} />
+              ) : (
+                <TextInput style={styles.textInput} placeholder="Digite seu apelido" placeholderTextColor="#475569" value={nickname} onChangeText={setNickname} maxLength={20} editable={!syncing} />
+              )}
             </View>
-            <TouchableOpacity style={[styles.startBtn, (nickname.trim() === '' || syncing) && { opacity: 0.5 }]} onPress={handleSaveIdentity} disabled={nickname.trim() === '' || syncing}>
-              {syncing ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.startBtnText}>Criar Terminal</Text>}
+            <TouchableOpacity style={[styles.startBtn, ((restoreMode ? restoreCode : nickname).trim() === '' || syncing) && { opacity: 0.5 }]} onPress={restoreMode ? handleRestoreIdentity : handleSaveIdentity} disabled={(restoreMode ? restoreCode : nickname).trim() === '' || syncing}>
+              {syncing ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.startBtnText}>{restoreMode ? 'Restaurar Terminal' : 'Criar Terminal'}</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.modeSwitch} onPress={() => { setRestoreMode(!restoreMode); setRestoreCode(''); }} disabled={syncing}>
+              <Text style={styles.modeSwitchText}>{restoreMode ? 'Criar um novo terminal' : 'Ja tenho um codigo de terminal'}</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -468,6 +540,8 @@ const styles = StyleSheet.create({
   textInput: { backgroundColor: '#111827', color: '#fff', padding: 15, borderRadius: 12, fontSize: 16, borderWidth: 1, borderColor: '#1F2937', width: '100%' },
   startBtn: { backgroundColor: '#111', borderRadius: 12, width: '100%', height: 55, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#222' },
   startBtnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  modeSwitch: { marginTop: 18, padding: 8 },
+  modeSwitchText: { color: '#00ff66', fontSize: 13, fontWeight: '600' },
   pinOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.95)', zIndex: 999, justifyContent: 'center', alignItems: 'center' },
   pinCard: { width: '90%', maxWidth: 320, backgroundColor: '#0d0d0d', borderRadius: 24, paddingVertical: 30, alignItems: 'center', borderWidth: 1, borderColor: '#1F2937' },
   pinTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold', marginBottom: 30 },

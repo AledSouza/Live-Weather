@@ -63,6 +63,8 @@ npm run build:apk # Gera build Android pelo EAS
 
 Os scripts SQL na raiz do projeto criam ou atualizam as estruturas usadas pelo app, incluindo perfis, grupos, descricoes e preview de links. Execute-os no SQL Editor do projeto Supabase na ordem adequada ao seu ambiente.
 
+Para habilitar a sincronizacao dos favoritos de GIF, execute `supabase-stickers.sql`. O app armazena apenas URLs e reconstroi os GIFs recentes pelas mensagens enviadas, sem copiar imagens para o Storage. Depois de reinstalar, use o codigo do terminal anterior para recuperar o mesmo perfil e seus favoritos.
+
 A funcao em `supabase/functions/link-preview` trata a obtencao de informacoes para previews de links. Consulte a documentacao do Supabase para publicar Edge Functions.
 
 ## Estrutura principal

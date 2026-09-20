@@ -12,6 +12,7 @@ import { useToast } from '../components/Toast';
 const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
 const GROUP_PREFIX = 'group:';
 const CONVERSATIONS_POLL_INTERVAL_MS = 30000;
+const CONVERSATIONS_CACHE_TTL_MS = 30000;
 const getGroupToken = (groupId) => `${GROUP_PREFIX}${groupId}`;
 const isGroupToken = (token) => String(token || '').startsWith(GROUP_PREFIX);
 const normalizeToken = (token) => String(token || '').trim().toLowerCase();
@@ -30,7 +31,7 @@ const extractStoragePath = (url) => {
   }
 };
 
-export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat, setPickerActive }) {
+export default function ChatListScreen({ onBack, userCode, userNickname, onOpenChat, setPickerActive, refreshKey = 0 }) {
   const toast = useToast();
   const [modalVisible, setModalVisible] = useState(false);
   const [groupModalVisible, setGroupModalVisible] = useState(false);
@@ -435,7 +436,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     }
   };
 
-  const fetchMyConversations = async () => {
+  const fetchMyConversations = async ({ force = true, showCached = true } = {}) => {
     if (!userCode) return;
     const myCleanCode = userCode.trim().toLowerCase();
     const withTimeout = (promise, ms = 15000) => Promise.race([
@@ -446,7 +447,16 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     // 🚀 CACHE: Carrega histórico salvo na memória para acesso instantâneo/offline
     try {
       const cached = await AsyncStorage.getItem(`@cache_chats_${myCleanCode}`);
-      if (cached) setChats(JSON.parse(cached));
+      if (cached) {
+        const parsedCache = JSON.parse(cached);
+        if (showCached) {
+          setChats(parsedCache.chats || parsedCache);
+          setLoadError(false);
+          setLoading(false);
+        }
+        const cachedAt = parsedCache.cachedAt || 0;
+        if (!force && Date.now() - cachedAt < CONVERSATIONS_CACHE_TTL_MS) return;
+      }
     } catch (e) {}
 
     try {
@@ -488,23 +498,31 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       } catch (_) {}
       setPinnedTokens([...new Set([...cloudPins, ...normalizePinnedTokens(localPins)])]);
 
-      // Busca todas as mensagens enviadas ou recebidas por você, ordenadas da mais nova para a mais velha
-      const { data: allMessages, error: messagesError } = await withTimeout(supabase
+      // Pagina para nao perder canais antigos quando o total passa do limite padrao do Supabase.
+      const fetchMessagePages = async (query) => {
+        const pageSize = 500;
+        const rows = [];
+        for (let from = 0; ; from += pageSize) {
+          const { data, error } = await withTimeout(query.range(from, from + pageSize - 1));
+          if (error) throw error;
+          rows.push(...(data || []));
+          if (!data || data.length < pageSize) return rows;
+        }
+      };
+
+      const allMessages = await fetchMessagePages(supabase
         .from('mensagens')
         .select('sender_code, receiver_code, content, media_url, media_type, read_at, created_at')
         .or(`sender_code.eq.${myCleanCode},receiver_code.eq.${myCleanCode}`)
         .order('created_at', { ascending: false }));
-      if (messagesError) throw messagesError;
 
       let groupMessages = [];
       if (groupTokens.length > 0) {
-        const { data: groupMsgRows, error: groupMessagesError } = await withTimeout(supabase
+        groupMessages = await fetchMessagePages(supabase
           .from('mensagens')
           .select('sender_code, receiver_code, content, media_url, media_type, read_at, created_at')
           .in('receiver_code', groupTokens)
           .order('created_at', { ascending: false }));
-        if (groupMessagesError) throw groupMessagesError;
-        groupMessages = groupMsgRows || [];
       }
 
       const messages = [...(allMessages || []), ...groupMessages].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -605,7 +623,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       setLoadError(false);
       
       // Atualiza o cache silenciosamente
-      AsyncStorage.setItem(`@cache_chats_${myCleanCode}`, JSON.stringify(finalChats)).catch(() => {});
+      AsyncStorage.setItem(`@cache_chats_${myCleanCode}`, JSON.stringify({
+        cachedAt: Date.now(),
+        chats: finalChats,
+      })).catch(() => {});
     } catch (err) {
       console.error('Erro ao carregar canais:', err);
       setLoadError(true);
@@ -614,7 +635,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
 
   useEffect(() => {
     loadPinnedChats();
-    fetchMyConversations();
+    fetchMyConversations({
+      force: refreshKey > 0,
+      showCached: refreshKey === 0,
+    });
 
     const cleanUserCode = userCode.trim().toLowerCase();
     
@@ -650,7 +674,7 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
       supabase.removeChannel(channelOutgoing); 
       supabase.removeChannel(channelGroups);
     };
-  }, [userCode]);
+  }, [userCode, refreshKey]);
 
   // 🚀 FUNÇÃO: Fixa ou desafixa o chat jogando as flags para a ordenação
   const handleTogglePinChat = async (token) => {
@@ -701,21 +725,10 @@ export default function ChatListScreen({ onBack, userCode, userNickname, onOpenC
     if (!isDevMode) return;
     try {
       const myCleanCode = userCode.trim().toLowerCase();
-      // 🚀 Coleta APENAS os contatos conhecidos (Seu próprio token foi removido)
-      const knownTokens = chats.map(c => c.token.toLowerCase());
-
-      if (knownTokens.length === 0) {
-        setSeenHistoryData([]);
-        setSeenHistoryTarget('Histórico Global de Terminais');
-        setSeenHistoryModalVisible(true);
-        return;
-      }
-
-      // 🚀 Puxa os últimos 50 acessos filtrando APENAS a sua lista de contatos
+      // O histórico global deve incluir terminais sem conversa ou contato salvo.
       const { data, error } = await supabase
         .from('logs_acesso')
         .select('connection_code, acessado_em')
-        .in('connection_code', knownTokens)
         .order('acessado_em', { ascending: false })
         .limit(50);
 
