@@ -1,5 +1,5 @@
-export const SUPABASE_URL = 'https://byqldmxkbtltrhwwihjx.supabase.co';
-export const SUPABASE_ANON_KEY = 'sb_publishable_pDknu1ErFeiEZemV2_Z8ng_MH0HQY3k';
+export const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL;
+export const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 export const AI_SENDER_CODE = 'gemini';
 export const GROUP_PREFIX = 'group:';
 export const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-flash'];

@@ -39,3 +39,5 @@ expo-verify*.log
 .kotlin/
 *.orig.*
 .metro-health-check*
+supabase/.temp/
+.expo-shared/

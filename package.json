@@ -1,5 +1,5 @@
 {
-  "name": "liveweather",
+  "name": "live-weather",
   "version": "3.0.1",
   "license": "0BSD",
   "main": "index.js",

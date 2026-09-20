@@ -6,11 +6,11 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { supabase } from '../supabase';
 
 const WEATHER_ART = {
-  clear: require('../assets_gatinho/DIA.png'),
-  clouds: require('../assets_gatinho/nublado.png'),
-  rain: require('../assets_gatinho/chuva.png'),
-  storm: require('../assets_gatinho/tempestade.png'),
-  night: require('../assets_gatinho/Noite.png'),
+  clear: require('../assets/weather/clear-day.png'),
+  clouds: require('../assets/weather/clouds.png'),
+  rain: require('../assets/weather/rain.png'),
+  storm: require('../assets/weather/storm.png'),
+  night: require('../assets/weather/clear-night.png'),
 };
 
 const getWeatherArt = (icon = '') => {
@@ -43,7 +43,7 @@ export default function WeatherScreen({ onUnlock, userCode }) {
   const [apiError, setApiError] = useState(null);
   const reveal = useRef(new Animated.Value(0)).current;
   const { height: screenHeight } = useWindowDimensions();
-  const API_KEY = 'cb4d2d940cde8d6eb30c2531b3392c41';
+  const API_KEY = process.env.EXPO_PUBLIC_OPENWEATHER_API_KEY;
 
   useEffect(() => {
     const loadSavedCity = async () => {

@@ -1,92 +1,79 @@
 # Live Weather
 
-Aplicativo mobile de previsao do tempo com recursos de comunicacao em tempo real. O projeto foi desenvolvido com Expo e React Native, com persistencia e autenticacao integradas ao Supabase.
-## Recursos
+Aplicativo mobile de previsao do tempo e comunicacao em tempo real, construido com Expo e React Native. O backend usa Supabase para autenticacao, persistencia, Storage, Realtime e Edge Functions.
 
-- Consulta do clima atual por cidade.
-- Previsao para os proximos dias.
-- Busca de municipios brasileiros.
-- Cache local da ultima consulta para melhorar a experiencia offline.
-- Perfis de usuario com cidade associada.
-- Lista de conversas e salas de chat individuais ou em grupo.
-- Envio de mensagens, imagens, videos, audio, documentos e figurinhas.
-- Respostas, mensagens fixadas, busca e visualizacao de links.
-- Notificacoes relacionadas ao clima e ao chat.
-- Tema visual adaptado as condicoes meteorologicas.
+## Funcionalidades
 
-## Tecnologias
+- Clima atual, previsao estendida e busca de municipios brasileiros.
+- Cache local da ultima consulta.
+- Perfis associados a cidades.
+- Conversas individuais e em grupo com texto, imagens, videos, audio, documentos e figurinhas.
+- Respostas, mensagens fixadas, busca, preview de links e notificacoes.
 
-- [Expo](https://expo.dev/) 54
-- React 19
-- React Native 0.81
-- Supabase
-- OpenWeather API
-- AsyncStorage
-- Expo Notifications, Camera, Media Library, AV e Image Picker
+## Stack
+
+- Expo 54, React 19 e React Native 0.81
+- Supabase (Database, Auth, Storage, Realtime e Edge Functions)
+- OpenWeather API e Giphy API
+- AsyncStorage e Expo Notifications
 
 ## Requisitos
 
 - Node.js 20 ou superior
 - npm
-- Expo Go para testar em um dispositivo, ou Android Studio/Xcode para executar localmente
-- Chave da API OpenWeather
-- Projeto Supabase configurado
+- Expo Go, Android Studio ou Xcode
+- Projeto Supabase e chaves das APIs externas
 
-## Instalacao
+## Configuracao local
 
-```bash
-npm install
-```
+1. Instale as dependencias:
 
-Configure as credenciais e servicos externos antes de executar o app. As chaves nao devem ser commitadas no repositorio. Para novas instalacoes, prefira variaveis de ambiente ou um arquivo local ignorado pelo Git.
+	```bash
+	npm install
+	```
 
-O arquivo `google-services.json` e usado pela configuracao Android do Expo. Use um arquivo pertencente ao seu proprio projeto Firebase e mantenha credenciais administrativas fora do repositorio.
+2. Copie `.env.example` para `.env` e preencha os valores do seu ambiente. Arquivos `.env` sao ignorados pelo Git.
 
-## Executar
+3. Para builds Android, configure um `google-services.json` do seu proprio projeto Firebase. O arquivo e referenciado pelo `app.json` e nao deve conter credenciais administrativas.
 
-Inicie o servidor de desenvolvimento:
+4. Inicie o Expo:
 
-```bash
-npm start
-```
+	```bash
+	npm start
+	```
 
 Comandos disponiveis:
 
 ```bash
-npm run android   # Executa no Android
-npm run ios       # Executa no iOS
-npm run web       # Executa na web
-npm run build:apk # Gera build Android pelo EAS
+npm run android
+npm run ios
+npm run web
+npm run build:apk
 ```
 
 ## Supabase
 
-Os scripts SQL na raiz do projeto criam ou atualizam as estruturas usadas pelo app, incluindo perfis, grupos, descricoes e preview de links. Execute-os no SQL Editor do projeto Supabase na ordem adequada ao seu ambiente.
+Os scripts `supabase-*.sql` documentam a estrutura necessaria para um projeto novo. Execute-os no SQL Editor conforme as dependencias do seu ambiente. A Edge Function `supabase/functions/link-preview` pode ser publicada com:
 
-Para habilitar a sincronizacao dos favoritos de GIF, execute `supabase-stickers.sql`. O app armazena apenas URLs e reconstroi os GIFs recentes pelas mensagens enviadas, sem copiar imagens para o Storage. Depois de reinstalar, use o codigo do terminal anterior para recuperar o mesmo perfil e seus favoritos.
+```bash
+supabase functions deploy link-preview
+```
 
-A funcao em `supabase/functions/link-preview` trata a obtencao de informacoes para previews de links. Consulte a documentacao do Supabase para publicar Edge Functions.
+O estado local da CLI em `supabase/.temp` nao faz parte do repositorio.
 
-## Estrutura principal
+## Estrutura
 
 ```text
-App.js                       Entrada e navegacao principal
-screens/WeatherScreen.js    Consulta e exibicao do clima
-screens/ChatListScreen.js    Lista de conversas e grupos
-screens/ChatRoomScreen.js    Sala de conversa e envio de midia
-screens/notificationService.js
-							 Servico de notificacoes
+App.js                       Entrada e navegacao
+screens/                     Telas e notificacoes
 components/                  Componentes reutilizaveis
+modules/chat/                Constantes e utilitarios do chat
+assets/                      Icones e ilustracoes do aplicativo
 supabase.js                  Cliente Supabase
 supabase/functions/          Edge Functions
-assets/                      Icones e imagens do app
+supabase-*.sql               Scripts de banco de dados
 ```
 
 ## Seguranca
 
-Nao adicione ao Git arquivos `.env`, chaves privadas, tokens, certificados ou credenciais administrativas. O `.gitignore` ja exclui arquivos de credenciais Firebase Admin e outros segredos comuns. Se uma chave for exposta, revogue-a no respectivo provedor e gere outra imediatamente.
-
-## Status
-
-Versao atual: **3.0.0**
-Este projeto esta em desenvolvimento.
+Nao versione `.env`, chaves privadas, certificados, tokens ou credenciais administrativas. O `google-services.json` contem configuracao publica do cliente Android; credenciais Firebase Admin devem permanecer fora do repositorio. Se uma chave for exposta, revogue-a no provedor e gere outra imediatamente.

@@ -610,7 +610,7 @@ export default function ChatRoomScreen({ onBack, userCode, friendCode, friendNam
   const [recentGifs, setRecentGifs] = useState([]);
   const [favoriteGifs, setFavoriteGifs] = useState([]); // 🚀 Favoritos
   const [giphyTab, setGiphyTab] = useState('recent'); // 'search', 'recent' ou 'favorites'
-  const GIPHY_API_KEY = 'u9JYVOpH3aNfJmB3qJWc5E42ln1kiwr9'; // Chave pessoal da API Giphy
+  const GIPHY_API_KEY = process.env.EXPO_PUBLIC_GIPHY_API_KEY;
   const GIPHY_PAGE_LIMIT = 24;
 
   // 🚀 ESTADOS DE PERSONALIZAÇÃO (CORES RGB)
